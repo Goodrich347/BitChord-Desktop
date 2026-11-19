@@ -1,0 +1,3779 @@
+diff --git a/web/app/src/components/music/TrackMenu.tsx b/web/app/src/components/music/TrackMenu.tsx
+index 2161eb4..79bcdff 100644
+--- a/web/app/src/components/music/TrackMenu.tsx
++++ b/web/app/src/components/music/TrackMenu.tsx
+@@ -1,4 +1,4 @@
+-import { ChevronLeft, ChevronRight, ListEnd, ListPlus, ListStart, MoreHorizontal, Star } from 'lucide-react';
++import { ChevronLeft, ChevronRight, ListEnd, ListPlus, ListStart, MoreHorizontal, Music, Star, Video } from 'lucide-react';
+ import { useCallback, useEffect, useState } from 'react';
+ import { Menu, MenuHeader, MenuItem, MenuSeparator, type MenuPlacement } from '@/components/Menu';
+ import {
+@@ -9,7 +9,11 @@ import {
+   useSignedIn,
+ } from '@/data/music/queries';
+ import type { Track } from '@/data/music/types';
++import { useParty } from '@/party/listenTogether';
+ import { usePlayer } from '@/state/player';
++import { useMusicOnly, kindFrom } from '@/state/musicOnly';
++import { useUi } from '@/state/ui';
++import { useHasVideo } from '@/state/video';
+ 
+ function PlaylistChoices({ videoId, onDone, onBack }: { videoId: string; onDone: () => void; onBack: () => void }) {
+   const options = usePlaylistOptions(videoId, true);
+@@ -76,6 +80,47 @@ function AccountItems({ track, onClose, onPlaylists }: { track: Track; onClose:
+   );
+ }
+ 
++/**
++ * Convert to audio / Convert to video, for the track that's playing
++ * (SongActionsMenu's onToggleAudioVersion): the other cut of the same
++ * recording — YouTube's own pair when it offers one, a search on the title and
++ * artist otherwise (player.convertVersion, data/music/versions.ts).
++ *
++ * Offered whether or not "Prefer song over music video" is on: the setting
++ * decides what plays on its own, this decides what plays now.
++ */
++function VersionItem({ track, onClose }: { track: Track; onClose: () => void }) {
++  const playing = usePlayer((s) => s.nowPlaying?.videoId === track.videoId);
++  const known = useMusicOnly((s) => s.kinds[track.videoId]);
++  const picture = useHasVideo(track.videoId);
++  // In a party everyone hears the one cut, so there is nothing to switch.
++  const inParty = useParty((s) => s.code !== null);
++  if (!playing || inParty) return null;
++  // Which cut plays: the queue's answer when it gave one, its picture when it
++  // didn't, and otherwise the catalogue's own tell — a video row names no album.
++  const isVideo = kindFrom(known, picture, track) === 'video';
++  return (
++    <>
++      <MenuItem
++        icon={isVideo ? <Music size={15} /> : <Video size={15} />}
++        onSelect={() => {
++          onClose();
++          void usePlayer
++            .getState()
++            .convertVersion()
++            .then((result) => {
++              if (result === 'no-video') useUi.getState().showNotice('No video version found for this song');
++              else if (result === 'no-audio') useUi.getState().showNotice('No audio version found');
++            });
++        }}
++      >
++        {isVideo ? 'Convert to audio' : 'Convert to video'}
++      </MenuItem>
++      <MenuSeparator />
++    </>
++  );
++}
++
+ function TrackMenuItems({ track, onClose }: { track: Track; onClose: () => void }) {
+   const [view, setView] = useState<'main' | 'playlists'>('main');
+   const signedIn = useSignedIn();
+@@ -85,6 +130,7 @@ function TrackMenuItems({ track, onClose }: { track: Track; onClose: () => void
+   const { playNext, addToQueue } = usePlayer.getState();
+   return (
+     <>
++      <VersionItem track={track} onClose={onClose} />
+       <MenuItem icon={<ListStart size={15} />} onSelect={() => (onClose(), playNext([track]))}>
+         Play Next
+       </MenuItem>
+diff --git a/web/app/src/data/match/trackMatcher.test.ts b/web/app/src/data/match/trackMatcher.test.ts
+index e2b9cc3..7677ca1 100644
+--- a/web/app/src/data/match/trackMatcher.test.ts
++++ b/web/app/src/data/match/trackMatcher.test.ts
+@@ -1,10 +1,12 @@
+ import { describe, expect, it } from 'vitest';
+ import {
+   best,
++  bestOfficialAudioForVideo,
+   hasConflictingAlbums,
+   matches,
+   queries,
+   romajiOf,
++  targetOf,
+   uniquelyMostCreditedCloseMatch,
+   type MatchCandidate,
+ } from './trackMatcher';
+@@ -139,6 +141,18 @@ describe('TrackMatcher', () => {
+     ]);
+   });
+ 
++  it('reads a queue row as the target to search and judge against', () => {
++    expect(
++      targetOf({
++        title: 'Kesariya',
++        artists: [{ name: 'Arijit Singh' }, { name: 'Pritam' }],
++        durationSec: 268,
++        album: { name: 'Brahmastra' },
++        explicit: true,
++      }),
++    ).toEqual({ title: 'Kesariya', artist: 'Arijit Singh, Pritam', durationSec: 268, album: 'Brahmastra', isExplicit: true, isVideo: false });
++  });
++
+   it('matches a bracketed CJK translation against its Latin filing', () => {
+     expect(matches(song('Love', 'Singer', '2:53'), '愛(Love)', 'Singer', 174)).toBe(true);
+     expect(matches(song('Love (愛)', 'Singer', '2:53'), '愛', 'Singer', 174)).toBe(true);
+@@ -148,3 +162,39 @@ describe('TrackMatcher', () => {
+     expect(matches(song('Night', 'Singer', '4:20'), '夜に駆ける (Racing Into The Night)', 'Singer', 260)).toBe(false);
+   });
+ });
++
++// TrackMatcher.bestOfficialAudioForVideo: the switch a listener asks for by
++// hand, where a video's visual intro or outro is a difference in runtime, not
++// in recording.
++describe('bestOfficialAudioForVideo', () => {
++  const video = { title: 'Kesariya - Brahmastra | Official Video', artist: 'Arijit Singh', durationSec: 340 };
++
++  it('accepts the official release however far the video’s runtime has drifted', () => {
++    const release = song('Kesariya', 'Arijit Singh', '3:20');
++    // Too far apart for the ordinary matcher, which is choosing a stream unseen.
++    expect(best([release], video)).toBeNull();
++    expect(bestOfficialAudioForVideo([release], video)).toBe(release);
++  });
++
++  it('still refuses a cover, another take, and another song', () => {
++    expect(bestOfficialAudioForVideo([song('Kesariya', 'Some Cover Band', '3:20')], video)).toBeNull();
++    expect(bestOfficialAudioForVideo([song('Kesariya (Acoustic)', 'Arijit Singh', '3:20')], video)).toBeNull();
++    expect(bestOfficialAudioForVideo([song('Raataan Lambiyan', 'Arijit Singh', '3:20')], video)).toBeNull();
++  });
++
++  it('ranks equivalent releases by runtime, and never by order', () => {
++    const near = song('Kesariya', 'Arijit Singh', '5:36');
++    const far = song('Kesariya', 'Arijit Singh', '3:20');
++    expect(bestOfficialAudioForVideo([far, near], video)).toBe(near);
++  });
++
++  it('prefers a fully credited release over a partly credited one', () => {
++    const shared = song('Kesariya', 'Arijit Singh', '5:40');
++    const exact = song('Kesariya', 'Arijit Singh, Pritam', '5:41');
++    expect(bestOfficialAudioForVideo([shared, exact], { ...video, artist: 'Arijit Singh, Pritam' })).toBe(exact);
++  });
++
++  it('has nothing to offer when the title carries no identity at all', () => {
++    expect(bestOfficialAudioForVideo([song('Kesariya', 'Arijit Singh', '3:20')], { title: '   ' })).toBeNull();
++  });
++});
+diff --git a/web/app/src/data/match/trackMatcher.ts b/web/app/src/data/match/trackMatcher.ts
+index 6ee64a0..a2afb98 100644
+--- a/web/app/src/data/match/trackMatcher.ts
++++ b/web/app/src/data/match/trackMatcher.ts
+@@ -31,6 +31,28 @@ export interface MatchTarget {
+   isVideo?: boolean;
+ }
+ 
++/** A queue row, as the matcher needs it (a Track, or anything shaped like one). */
++export interface TrackLike {
++  title: string;
++  artists: readonly { name: string }[];
++  durationSec: number | null;
++  album: { name: string } | null;
++  explicit?: boolean;
++  isVideo?: boolean;
++}
++
++/** TrackMatcher.targetOf: the recording a row is, as a target to search and judge against. */
++export function targetOf(track: TrackLike): MatchTarget {
++  return {
++    title: track.title,
++    artist: track.artists.map((artist) => artist.name).join(', '),
++    durationSec: track.durationSec,
++    album: track.album?.name ?? null,
++    isExplicit: track.explicit ?? null,
++    isVideo: track.isVideo ?? false,
++  };
++}
++
+ interface TitleParts {
+   words: string[];
+   core: string;
+@@ -166,6 +188,42 @@ export function best<T extends MatchCandidate>(candidates: T[], target: MatchTar
+   return ranked(candidates, target)[0] ?? null;
+ }
+ 
++/**
++ * The catalogue counterpart for a music-video upload selected explicitly by
++ * the listener (TrackMatcher.bestOfficialAudioForVideo).
++ *
++ * A video and the song it promotes can legitimately differ by well over a
++ * minute: the video includes an intro, an outro and sometimes dialogue. The
++ * ordinary matcher must reject that gap because it is choosing a stream
++ * without anyone watching it. The player's audio switch is a different
++ * contract: it asks YouTube Music's *Songs* shelf for the official release of
++ * a known video. Here an exact recording title, identical version markers and
++ * a shared artist are enough to establish that relationship; duration only
++ * ranks equivalent releases and never vetoes one.
++ *
++ * This remains deliberately stricter than a search engine's first row. A
++ * cover, remix or karaoke version still cannot cross the switch just because
++ * it happens to share a title.
++ */
++export function bestOfficialAudioForVideo<T extends MatchCandidate>(candidates: T[], target: MatchTarget): T | null {
++  const wanted = parseTitle(target.title, target.artist ?? '');
++  if (!wanted.core.trim()) return null;
++  let best: { candidate: T; value: number } | null = null;
++  for (const candidate of candidates) {
++    const got = parseTitle(candidate.title, candidate.artist);
++    if (wanted.core !== got.core || !sameSet(wanted.versions, got.versions)) continue;
++    const artist = artistScore(target.artist ?? '', candidate.artist);
++    if (artist === null) continue;
++    const actual = positive(candidate.durationSec);
++    // An unstated runtime ranks below every stated one rather than ruling the row out.
++    const duration = target.durationSec != null ? (actual === null ? -120 : -Math.abs(target.durationSec - actual)) : 0;
++    const value = artist * 1000 + duration;
++    // Kotlin's stable sort keeps the search's order on a tie, so only a strictly better row wins.
++    if (!best || value > best.value) best = { candidate, value };
++  }
++  return best?.candidate ?? null;
++}
++
+ export function ranked<T extends MatchCandidate>(candidates: T[], target: MatchTarget): T[] {
+   const scored = candidates.flatMap((candidate) => {
+     const value = score(candidate, target);
+diff --git a/web/app/src/data/music/api.ts b/web/app/src/data/music/api.ts
+index 6e1dd67..96516b1 100644
+--- a/web/app/src/data/music/api.ts
++++ b/web/app/src/data/music/api.ts
+@@ -3,6 +3,9 @@ import type { Candidate } from '@/playback/queue/builder';
+ import { getInnertube, getMusicClient, getSignedInnertube } from '@/playback/youtube/innertube';
+ import { isExactArtistMatch, normalizedArtistName } from '@/lib/artistCredits';
+ import { LIBRARY_SECTIONS, LIKED_MUSIC_PLAYLIST, type LibrarySection } from './library';
++import { cutPair, isMusicVideo, rowCuts } from './cuts';
++import { timeMapsOf, type VersionTimeMap } from './timeMap';
++import { createVersionResolver } from './versions';
+ import {
+   mapAlbum,
+   mapArtist,
+@@ -86,9 +89,26 @@ export async function fetchSearch(query: string): Promise<SearchResults> {
+ /** YouTube Music's Songs shelf for [query]: what an import or a match is chosen from. */
+ export async function searchSongs(query: string): Promise<Track[]> {
+   const yt = await getMusicClient();
+-  const search = await yt.music.search(query, { type: 'song' });
+-  const shelf = search.songs ?? search.contents?.find((c) => c.type === 'MusicShelf');
+-  return mapPlaylistTracks((shelf as { contents?: readonly unknown[] } | undefined)?.contents ?? []);
++  return shelfTracks(await yt.music.search(query, { type: 'song' }), 'songs');
++}
++
++/**
++ * The Videos shelf for [query]: what turning a catalogue song back into its
++ * music video is chosen from (resolveVideo).
++ */
++export async function searchVideos(query: string): Promise<Track[]> {
++  const yt = await getMusicClient();
++  return shelfTracks(await yt.music.search(query, { type: 'video' }), 'videos');
++}
++
++/**
++ * The rows of a filtered search. YouTube.js names the shelf by its heading
++ * ("Songs"), which is a translated word on a non-English UI, so the filter's
++ * own shelf is taken and the first shelf stands in when it is missing.
++ */
++function shelfTracks(search: YTMusic.Search, shelf: 'songs' | 'videos'): Track[] {
++  const named = search[shelf] ?? search.contents?.find((c) => c.type === 'MusicShelf');
++  return mapPlaylistTracks((named as { contents?: readonly unknown[] } | undefined)?.contents ?? []);
+ }
+ 
+ export async function fetchSuggestions(input: string): Promise<Suggestions> {
+@@ -295,17 +315,6 @@ export async function createPlaylist(title: string, videoIds: string[], descript
+ 
+ // ---- AutoPlay (phase 6) -------------------------------------------------------------
+ 
+-/**
+- * A music video rather than the catalogue song: YouTube marks each watch
+- * endpoint with its type, ATV for the song and OMV/UGC for videos. (A radio
+- * seeded on a video id is all videos; one seeded on a song is mostly songs.)
+- */
+-function isMusicVideo(item: YTNodes.PlaylistPanelVideo): boolean {
+-  const type = (item.endpoint?.payload as { watchEndpointMusicSupportedConfigs?: { watchEndpointMusicConfig?: { musicVideoType?: string } } } | undefined)
+-    ?.watchEndpointMusicSupportedConfigs?.watchEndpointMusicConfig?.musicVideoType;
+-  return type !== undefined ? type !== 'MUSIC_VIDEO_TYPE_ATV' : !item.album;
+-}
+-
+ /** A station, and which cut it was seeded on: a music video's station is built from music videos. */
+ export interface Radio {
+   candidates: Candidate[];
+@@ -326,7 +335,7 @@ export async function fetchRadio(videoId: string): Promise<Radio> {
+   const yt = await getMusicClient();
+   const panel = await yt.music.getUpNext(videoId, true);
+   const rows = panel.contents as unknown as Raw[];
+-  const seedCut = rows.flatMap(panelCuts).find((cut) => cut.video_id === videoId);
++  const seedCut = rows.flatMap(rowCuts).find((cut) => cut.video_id === videoId);
+   const seedIsVideo = seedCut ? isMusicVideo(seedCut) : false;
+   return {
+     candidates: rows.map((raw) => panelCandidate(raw, seedIsVideo)).filter((c): c is Candidate => c !== null),
+@@ -334,39 +343,87 @@ export async function fetchRadio(videoId: string): Promise<Radio> {
+   };
+ }
+ 
+-/**
+- * A watch-queue row's cuts. A wrapper pairs the two cuts of one track (song
+- * and music video), with either as its primary.
+- */
+-function panelCuts(raw: Raw): YTNodes.PlaylistPanelVideo[] {
+-  const cuts = (raw.type === 'PlaylistPanelVideoWrapper'
+-    ? [raw.primary, ...((raw.counterpart as unknown[] | undefined) ?? [])]
+-    : [raw]) as (YTNodes.PlaylistPanelVideo | null | undefined)[];
+-  return cuts.filter((c): c is YTNodes.PlaylistPanelVideo => c?.type === 'PlaylistPanelVideo');
++/** One watch-queue cut as a track. */
++function panelTrack(item: YTNodes.PlaylistPanelVideo): Track {
++  const thumbs = [...(item.thumbnail ?? [])].sort((a, b) => b.width - a.width);
++  return {
++    videoId: item.video_id,
++    title: item.title?.toString() ?? '',
++    artists: (item.artists ?? []).map((a) => ({ name: a.name, id: a.channel_id ?? null })),
++    album: item.album ? { name: item.album.name, id: item.album.id ?? null } : null,
++    durationSec: item.duration?.seconds || null,
++    explicit: (item.badges ?? []).some((b) => /explicit/i.test(JSON.stringify(b))),
++    thumbnail: thumbs[0]?.url ?? null,
++    index: null,
++    plays: null,
++  };
+ }
+ 
+ /** One watch-queue row as a track: the catalogue song (the cut with an album), or its music video for [wantVideo]. */
+ function panelCandidate(raw: Raw, wantVideo = false): Candidate | null {
+-  const panelVideos = panelCuts(raw);
++  const panelVideos = rowCuts(raw);
+   const item = panelVideos.find((c) => isMusicVideo(c) === wantVideo) ?? panelVideos[0];
+   if (!item?.video_id) return null;
+-  const thumbs = [...(item.thumbnail ?? [])].sort((a, b) => b.width - a.width);
++  return { track: panelTrack(item), isVideo: isMusicVideo(item) };
++}
++
++/** One cut of a track, as a queue would play it, and which recording it is. */
++export interface Cut {
++  track: Track;
++  isVideo: boolean;
++}
++
++/**
++ * Both cuts of [videoId]'s track, from its watch queue: the one it is and the
++ * other one (MusicOnlyPlayback's lookup). Null when no row holds it, or when
++ * there is no other cut.
++ */
++export async function findCuts(videoId: string): Promise<{ self: Cut; other: Cut | null } | null> {
++  const yt = await getMusicClient();
++  const panel = await yt.music.getUpNext(videoId, true);
++  const row = (panel.contents as unknown as Raw[]).find((raw) => rowCuts(raw).some((cut) => cut.video_id === videoId));
++  const pair = row && cutPair(rowCuts(row), videoId);
++  if (!pair) return null;
+   return {
+-    track: {
+-      videoId: item.video_id,
+-      title: item.title?.toString() ?? '',
+-      artists: (item.artists ?? []).map((a) => ({ name: a.name, id: a.channel_id ?? null })),
+-      album: item.album ? { name: item.album.name, id: item.album.id ?? null } : null,
+-      durationSec: item.duration?.seconds || null,
+-      explicit: (item.badges ?? []).some((b) => /explicit/i.test(JSON.stringify(b))),
+-      thumbnail: thumbs[0]?.url ?? null,
+-      index: null,
+-      plays: null,
+-    },
+-    isVideo: isMusicVideo(item),
++    self: { track: panelTrack(pair.self), isVideo: isMusicVideo(pair.self) },
++    other: pair.other ? { track: panelTrack(pair.other), isVideo: isMusicVideo(pair.other) } : null,
+   };
+ }
+ 
++/** [videoId]'s other cut: its song when it's a music video, its video when it's a song. */
++export async function findCounterpart(videoId: string): Promise<Cut | null> {
++  return (await findCuts(videoId))?.other ?? null;
++}
++
++/**
++ * YouTube's own answer on the other cut, and a search for it when YouTube
++ * offers none (data/music/versions.ts). The app's one resolver, so a lookup
++ * made by the setting is not made again by the menu.
++ */
++const versions = createVersionResolver({ findCuts, searchSongs, searchVideos });
++
++/** [track] heard as its catalogue song, or itself when there is none (resolveAudio). */
++export const resolveAudio = versions.resolveAudio;
++/** [track]'s music video, or null when there is none (resolveVideo). */
++export const resolveVideo = versions.resolveVideo;
++/** The cut YouTube itself paired with [videoId], or null when it paired nothing. */
++export const pairedWith = versions.pairedWith;
++
++/**
++ * How YouTube lines [videoId] up with every cut it pairs with it, by the
++ * other cut's id: the `segmentMap` its Song/Video switch seeks with
++ * (YtMusicRepository.officialVersion, InnertubeParser.timeMapOf).
++ *
++ * YouTube.js's parser keeps the rows but drops the map, so the response is
++ * read raw here. Empty when YouTube pairs nothing — every signed-out response,
++ * and any upload that is not an official video.
++ */
++export async function fetchTimeMaps(videoId: string): Promise<Map<string, VersionTimeMap>> {
++  const yt = await getMusicClient();
++  const response = await yt.actions.execute('/next', { videoId, client: 'YTMUSIC' });
++  return timeMapsOf(response.data, videoId);
++}
++
+ // ---- Player links ---------------------------------------------------------------
+ 
+ /**
+@@ -378,7 +435,7 @@ export async function fetchTrackLinks(videoId: string): Promise<Track | null> {
+   const yt = await getMusicClient();
+   const panel = await yt.music.getUpNext(videoId, false);
+   // The row holding this video, by either of its cuts; its catalogue cut names the album.
+-  const row = (panel.contents as unknown as Raw[]).find((raw) => panelCuts(raw).some((cut) => cut.video_id === videoId));
++  const row = (panel.contents as unknown as Raw[]).find((raw) => rowCuts(raw).some((cut) => cut.video_id === videoId));
+   return (row && panelCandidate(row)?.track) ?? null;
+ }
+ 
+diff --git a/web/app/src/data/music/cuts.test.ts b/web/app/src/data/music/cuts.test.ts
+new file mode 100644
+index 0000000..6a54552
+--- /dev/null
++++ b/web/app/src/data/music/cuts.test.ts
+@@ -0,0 +1,72 @@
++import { describe, expect, it } from 'vitest';
++import type { YTNodes } from 'youtubei.js/web';
++import { cutPair, isMusicVideo, rowCuts } from './cuts';
++
++// The up-next fixtures have no wrapper rows, so the pair is built here: the
++// shape YouTube Music's watch queue uses for the two cuts of one track.
++
++function cut(videoId: string, video: boolean, album?: string) {
++  return {
++    type: 'PlaylistPanelVideo',
++    video_id: videoId,
++    title: { toString: () => videoId },
++    album: album ? { name: album, id: 'MPREb_test' } : undefined,
++    endpoint: {
++      payload: {
++        watchEndpointMusicSupportedConfigs: {
++          watchEndpointMusicConfig: { musicVideoType: video ? 'MUSIC_VIDEO_TYPE_OMV' : 'MUSIC_VIDEO_TYPE_ATV' },
++        },
++      },
++    },
++  } as unknown as YTNodes.PlaylistPanelVideo;
++}
++
++const wrapper = (primary: YTNodes.PlaylistPanelVideo, counterpart: YTNodes.PlaylistPanelVideo) =>
++  ({ type: 'PlaylistPanelVideoWrapper', primary, counterpart: [counterpart] }) as Record<string, unknown>;
++
++describe('isMusicVideo', () => {
++  it('reads the watch endpoint: ATV is the song, OMV and UGC are videos', () => {
++    expect(isMusicVideo(cut('song', false))).toBe(false);
++    expect(isMusicVideo(cut('video', true))).toBe(true);
++  });
++
++  it('falls back on the album when the endpoint says nothing', () => {
++    const bare = { type: 'PlaylistPanelVideo', video_id: 'x', album: { name: 'Album', id: null } };
++    expect(isMusicVideo(bare as unknown as YTNodes.PlaylistPanelVideo)).toBe(false);
++    const noAlbum = { type: 'PlaylistPanelVideo', video_id: 'y' };
++    expect(isMusicVideo(noAlbum as unknown as YTNodes.PlaylistPanelVideo)).toBe(true);
++  });
++});
++
++describe('rowCuts', () => {
++  it('takes both slots of a wrapper and the one row of anything else', () => {
++    const song = cut('song', false, 'Album');
++    const video = cut('video', true);
++    expect(rowCuts(wrapper(song, video))).toEqual([song, video]);
++    expect(rowCuts({ type: 'PlaylistPanelVideo', video_id: 'solo' } as Record<string, unknown>)).toHaveLength(1);
++  });
++});
++
++describe('cutPair', () => {
++  const song = cut('song', false, 'Album');
++  const video = cut('video', true);
++
++  it('finds the other cut whichever slot it is in', () => {
++    const fromVideo = cutPair(rowCuts(wrapper(song, video)), 'video');
++    expect(fromVideo?.self).toBe(video);
++    expect(fromVideo?.other).toBe(song);
++    const fromSong = cutPair(rowCuts(wrapper(video, song)), 'song');
++    expect(fromSong?.self).toBe(song);
++    expect(fromSong?.other).toBe(video);
++  });
++
++  it('has no other cut when the row holds only the one', () => {
++    const pair = cutPair([song], 'song');
++    expect(pair?.self).toBe(song);
++    expect(pair?.other).toBeNull();
++  });
++
++  it("says nothing for a video id the row doesn't hold", () => {
++    expect(cutPair(rowCuts(wrapper(song, video)), 'someone-else')).toBeNull();
++  });
++});
+diff --git a/web/app/src/data/music/cuts.ts b/web/app/src/data/music/cuts.ts
+new file mode 100644
+index 0000000..9729240
+--- /dev/null
++++ b/web/app/src/data/music/cuts.ts
+@@ -0,0 +1,42 @@
++import type { YTNodes } from 'youtubei.js/web';
++
++/**
++ * A watch-queue row's cuts. YouTube Music carries the same recording twice —
++ * the catalogue song and its music video — and a wrapper row pairs the two,
++ * with either of them as its primary. Which one is which is the whole of what
++ * "Prefer song over music video" and the player menu's Convert item ask.
++ */
++
++/**
++ * A music video rather than the catalogue song: YouTube marks each watch
++ * endpoint with its type, ATV for the song and OMV/UGC for videos. (A radio
++ * seeded on a video id is all videos; one seeded on a song is mostly songs.)
++ */
++export function isMusicVideo(item: YTNodes.PlaylistPanelVideo): boolean {
++  const type = (item.endpoint?.payload as { watchEndpointMusicSupportedConfigs?: { watchEndpointMusicConfig?: { musicVideoType?: string } } } | undefined)
++    ?.watchEndpointMusicSupportedConfigs?.watchEndpointMusicConfig?.musicVideoType;
++  return type !== undefined ? type !== 'MUSIC_VIDEO_TYPE_ATV' : !item.album;
++}
++
++/** Every cut in row [raw], from whichever of the wrapper's slots they came. */
++export function rowCuts(raw: Record<string, unknown>): YTNodes.PlaylistPanelVideo[] {
++  const cuts = (raw.type === 'PlaylistPanelVideoWrapper'
++    ? [raw.primary, ...((raw.counterpart as unknown[] | undefined) ?? [])]
++    : [raw]) as (YTNodes.PlaylistPanelVideo | null | undefined)[];
++  return cuts.filter((c): c is YTNodes.PlaylistPanelVideo => c?.type === 'PlaylistPanelVideo');
++}
++
++/**
++ * [videoId]'s own cut among [cuts], and the other cut of the same track: its
++ * song when it's a video, its video when it's a song. Null when no cut is
++ * [videoId]; [other] is null when the row holds only the one.
++ */
++export function cutPair(
++  cuts: readonly YTNodes.PlaylistPanelVideo[],
++  videoId: string,
++): { self: YTNodes.PlaylistPanelVideo; other: YTNodes.PlaylistPanelVideo | null } | null {
++  const self = cuts.find((cut) => cut.video_id === videoId);
++  if (!self) return null;
++  const other = cuts.find((cut) => cut.video_id !== videoId && isMusicVideo(cut) !== isMusicVideo(self)) ?? null;
++  return { self, other };
++}
+diff --git a/web/app/src/data/music/timeMap.test.ts b/web/app/src/data/music/timeMap.test.ts
+new file mode 100644
+index 0000000..a6ef270
+--- /dev/null
++++ b/web/app/src/data/music/timeMap.test.ts
+@@ -0,0 +1,132 @@
++import { describe, expect, it } from 'vitest';
++import { VersionTimeMap, timeMapOf, timeMapsOf } from './timeMap';
++
++// Ported from shared/…/VersionPairTest.kt (timeMap_landsWhereTheMusicResumes…)
++// and InnertubeParser.timeMapOf: the segmentMap YouTube's own Song/Video
++// switch seeks with, read off a raw /next response.
++
++const map = new VersionTimeMap([
++  { fromStartMs: 10_000, toStartMs: 0, durationMs: 60_000 },
++  // A 20s skit in the video between the two halves.
++  { fromStartMs: 90_000, toStartMs: 60_000, durationMs: 60_000 },
++]);
++
++describe('VersionTimeMap', () => {
++  it('lands where the music resumes outside a stretch', () => {
++    expect(map.map(3_000)).toBe(0); // intro
++    expect(map.map(60_000)).toBe(50_000); // first half
++    expect(map.map(80_000)).toBe(60_000); // skit
++    expect(map.map(120_000)).toBe(90_000); // second half
++    expect(map.map(200_000)).toBe(120_000); // outro
++    expect(map.inverted().map(90_000)).toBe(120_000);
++  });
++
++  it('needs at least one segment', () => {
++    expect(() => new VersionTimeMap([])).toThrow();
++  });
++});
++
++const counterpart = (videoId: string, segmentMap?: unknown) => ({
++  counterpartRenderer: { playlistPanelVideoRenderer: { videoId } },
++  ...(segmentMap ? { segmentMap } : {}),
++});
++
++const segments = {
++  segment: [
++    // protobuf writes int64s as strings, which both forms must survive.
++    { primaryVideoStartTimeMilliseconds: '10000', counterpartVideoStartTimeMilliseconds: '0', durationMilliseconds: '60000' },
++    { primaryVideoStartTimeMilliseconds: 90_000, counterpartVideoStartTimeMilliseconds: 60_000, durationMilliseconds: 60_000 },
++  ],
++};
++
++describe('timeMapOf', () => {
++  it('reads a counterpart’s segments, skipping the ones it cannot use', () => {
++    const read = timeMapOf({ segmentMap: { segment: [...segments.segment, { primaryVideoStartTimeMilliseconds: '1' }] } });
++    expect(read?.segments).toHaveLength(2);
++    expect(read?.map(120_000)).toBe(90_000);
++  });
++
++  it('gives nothing for a counterpart without a map', () => {
++    expect(timeMapOf(counterpart('song1'))).toBeNull();
++  });
++});
++
++describe('timeMapsOf', () => {
++  const root = {
++    contents: {
++      wrapper: [
++        { playlistPanelVideoWrapperRenderer: { primaryRenderer: { playlistPanelVideoRenderer: { videoId: 'vid1' } }, counterpart: [counterpart('song1', segments)] } },
++        { playlistPanelVideoWrapperRenderer: { primaryRenderer: { playlistPanelVideoRenderer: { videoId: 'other' } }, counterpart: [counterpart('vid2', segments)] } },
++      ],
++    },
++  };
++
++  // The canonical pair, as VersionPairTest.kt words it: the video opens on 12s
++  // of dialogue and the two cuts run the same 180s after that.
++  const pair = (primary: string, counterpartId: string) => ({
++    contents: [
++      {
++        playlistPanelVideoWrapperRenderer: {
++          primaryRenderer: { playlistPanelVideoRenderer: { videoId: primary } },
++          counterpart: [
++            {
++              counterpartRenderer: { playlistPanelVideoRenderer: { videoId: counterpartId } },
++              segmentMap: {
++                segment: [
++                  {
++                    primaryVideoStartTimeMilliseconds: '12000',
++                    counterpartVideoStartTimeMilliseconds: '0',
++                    durationMilliseconds: '180000',
++                  },
++                ],
++              },
++            },
++          ],
++        },
++      },
++    ],
++  });
++
++  it('maps the video’s dialogue intro to the start of the song', () => {
++    expect(timeMapsOf(pair('omv1', 'atv1'), 'omv1').get('atv1')?.map(42_000)).toBe(30_000);
++  });
++
++  it('reads it backwards when YouTube put the song first', () => {
++    const songFirst = {
++      contents: [
++        {
++          playlistPanelVideoWrapperRenderer: {
++            primaryRenderer: { playlistPanelVideoRenderer: { videoId: 'atv1' } },
++            counterpart: [
++              {
++                counterpartRenderer: { playlistPanelVideoRenderer: { videoId: 'omv1' } },
++                segmentMap: {
++                  segment: [
++                    {
++                      primaryVideoStartTimeMilliseconds: 0,
++                      counterpartVideoStartTimeMilliseconds: 12000,
++                      durationMilliseconds: 180000,
++                    },
++                  ],
++                },
++              },
++            ],
++          },
++        },
++      ],
++    };
++    expect(timeMapsOf(songFirst, 'omv1').get('atv1')?.map(42_000)).toBe(30_000);
++  });
++
++  it('maps the track asked about to the cut it is paired with', () => {
++    expect(timeMapsOf(root, 'vid1').get('song1')?.map(120_000)).toBe(90_000);
++  });
++
++  it('reads the map backwards when the track is the counterpart', () => {
++    expect(timeMapsOf(root, 'vid2').get('other')?.map(90_000)).toBe(120_000);
++  });
++
++  it('gives nothing when YouTube pairs it with nothing', () => {
++    expect(timeMapsOf({ contents: [{ playlistPanelVideoRenderer: { videoId: 'vid1' } }] }, 'vid1').size).toBe(0);
++  });
++});
+diff --git a/web/app/src/data/music/timeMap.ts b/web/app/src/data/music/timeMap.ts
+new file mode 100644
+index 0000000..4ad7954
+--- /dev/null
++++ b/web/app/src/data/music/timeMap.ts
+@@ -0,0 +1,124 @@
++/**
++ * YouTube Music's own word on how a music video and the song it is a video of
++ * line up — the `segmentMap` its Song/Video switch reads. A port of
++ * VersionTimeMap.kt and InnertubeParser.timeMapOf.
++ *
++ * Nothing is measured to get this: it arrives with the version pair itself, so
++ * a switch that has one lands on the same moment without fetching or decoding
++ * either stream. YouTube.js's parser drops the map (it only keeps the parsed
++ * rows), so api.ts reads it off the raw `/next` response and hands the object
++ * to `timeMapsOf` here.
++ */
++
++/** A stretch both cuts share, [durationMs] long in each. */
++export interface TimeSegment {
++  fromStartMs: number;
++  toStartMs: number;
++  durationMs: number;
++}
++
++export class VersionTimeMap {
++  /** Sorted by where each stretch starts in the cut this map reads from. */
++  readonly segments: readonly TimeSegment[];
++
++  constructor(segments: readonly TimeSegment[]) {
++    if (!segments.length) throw new Error('a time map needs at least one segment');
++    this.segments = [...segments].sort((a, b) => a.fromStartMs - b.fromStartMs);
++  }
++
++  /**
++   * Where [positionMs] in the playing cut falls in the other one.
++   *
++   * Inside a shared stretch it is exact. Outside one — a video's spoken intro,
++   * a skit between verses — there is no matching moment, so it lands where the
++   * music picks up again; past the last stretch, at its end.
++   */
++  map(positionMs: number): number {
++    for (const segment of this.segments) {
++      if (positionMs < segment.fromStartMs) return segment.toStartMs;
++      const into = positionMs - segment.fromStartMs;
++      if (into < segment.durationMs) return segment.toStartMs + into;
++    }
++    const last = this.segments[this.segments.length - 1]!;
++    return last.toStartMs + last.durationMs;
++  }
++
++  /** The same pairing read from the other side. */
++  inverted(): VersionTimeMap {
++    return new VersionTimeMap(this.segments.map((s) => ({ fromStartMs: s.toStartMs, toStartMs: s.fromStartMs, durationMs: s.durationMs })));
++  }
++}
++
++type Raw = Record<string, unknown>;
++
++const object = (value: unknown): Raw | null => (value && typeof value === 'object' && !Array.isArray(value) ? (value as Raw) : null);
++const array = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
++
++/** Protobuf writes int64s as JSON strings; both forms are read, as on the phone. */
++function milliseconds(value: unknown): number | null {
++  const number = typeof value === 'string' && value.trim() ? Number(value) : typeof value === 'number' ? value : NaN;
++  return Number.isFinite(number) ? number : null;
++}
++
++/**
++ * A counterpart's `segmentMap`: where every stretch the two share starts in
++ * each, and how long it runs. Null when there is no map (every signed-out
++ * response, and anything YouTube does not consider a version of the other).
++ */
++export function timeMapOf(counterpart: unknown): VersionTimeMap | null {
++  const segments = array(object(object(counterpart)?.segmentMap)?.segment).flatMap((entry) => {
++    const segment = object(entry);
++    const fromStartMs = milliseconds(segment?.primaryVideoStartTimeMilliseconds);
++    const toStartMs = milliseconds(segment?.counterpartVideoStartTimeMilliseconds);
++    const durationMs = milliseconds(segment?.durationMilliseconds);
++    if (fromStartMs === null || toStartMs === null || durationMs === null || durationMs <= 0) return [];
++    return [{ fromStartMs, toStartMs, durationMs }];
++  });
++  return segments.length ? new VersionTimeMap(segments) : null;
++}
++
++/** Every object stored under [key], anywhere inside a raw response (api.ts's `collect`). */
++function collect(root: unknown, key: string, out: Raw[] = []): Raw[] {
++  if (Array.isArray(root)) for (const item of root) collect(item, key, out);
++  else if (root && typeof root === 'object') {
++    for (const [k, v] of Object.entries(root)) {
++      if (k === key && v && typeof v === 'object' && !Array.isArray(v)) out.push(v as Raw);
++      else collect(v, key, out);
++    }
++  }
++  return out;
++}
++
++/** The `playlistPanelVideoRenderer` a wrapper half carries, if any. */
++const panelOf = (half: unknown): Raw | null => {
++  const renderer = object(object(half)?.playlistPanelVideoRenderer);
++  return typeof renderer?.videoId === 'string' ? renderer : null;
++};
++
++/**
++ * InnertubeParser.parseVersionPair's map bookkeeping: from [videoId], the time
++ * map to every cut YouTube pairs it with in this response.
++ *
++ * The pair can come back either way round — the track asked about as the row's
++ * primary with the other version as its counterpart, or the other way, in
++ * which case the map is read backwards.
++ */
++export function timeMapsOf(root: unknown, videoId: string): Map<string, VersionTimeMap> {
++  const out = new Map<string, VersionTimeMap>();
++  for (const wrapper of collect(root, 'playlistPanelVideoWrapperRenderer')) {
++    const primary = panelOf(wrapper.primaryRenderer);
++    const counterparts = array(wrapper.counterpart).map((entry) => ({ node: entry, panel: panelOf(object(entry)?.counterpartRenderer) }));
++    if (primary?.videoId === videoId) {
++      for (const counterpart of counterparts) {
++        const map = timeMapOf(counterpart.node);
++        if (map && counterpart.panel) out.set(counterpart.panel.videoId as string, map);
++      }
++      continue;
++    }
++    const asCounterpart = counterparts.find((entry) => entry.panel?.videoId === videoId);
++    if (!asCounterpart || !primary) continue;
++    const map = timeMapOf(asCounterpart.node)?.inverted();
++    if (map) out.set(primary.videoId as string, map);
++  }
++  return out;
++}
+diff --git a/web/app/src/data/music/versions.test.ts b/web/app/src/data/music/versions.test.ts
+new file mode 100644
+index 0000000..91715db
+--- /dev/null
++++ b/web/app/src/data/music/versions.test.ts
+@@ -0,0 +1,163 @@
++import { describe, expect, it, vi } from 'vitest';
++import type { Cut } from '@/data/music/api';
++import type { Track } from '@/data/music/types';
++import { createVersionResolver, type VersionSources } from './versions';
++
++// Ported from YtMusicRepository's resolveAudio / resolveVideo: what the app
++// asks YouTube for when a track is switched between its two cuts, and what it
++// settles on when YouTube pairs nothing — which is every signed-out response.
++
++const track = (
++  videoId: string,
++  title: string,
++  artist: string,
++  durationSec: number | null = null,
++  album: string | null = null,
++): Track => ({
++  videoId,
++  title,
++  artists: artist ? [{ name: artist, id: null }] : [],
++  album: album ? { name: album, id: null } : null,
++  durationSec,
++  explicit: false,
++  thumbnail: null,
++  index: null,
++  plays: null,
++});
++
++const cut = (t: Track, isVideo: boolean): Cut => ({ track: t, isVideo });
++
++const VIDEO = track('vid1', 'Kesariya - Brahmastra | Official Video', 'Arijit Singh', 271);
++const SONG = track('song1', 'Kesariya', 'Arijit Singh', 268, 'Brahmastra');
++
++function sources(overrides: Partial<VersionSources> = {}): VersionSources {
++  return {
++    findCuts: vi.fn(async () => null),
++    searchSongs: vi.fn(async () => [] as Track[]),
++    searchVideos: vi.fn(async () => [] as Track[]),
++    ...overrides,
++  };
++}
++
++describe('resolveAudio', () => {
++  it('takes YouTube’s pair without searching', async () => {
++    const deps = sources({ findCuts: vi.fn(async () => ({ self: cut(VIDEO, true), other: cut(SONG, false) })) });
++    const { resolveAudio, pairedWith } = createVersionResolver(deps);
++
++    await expect(resolveAudio(VIDEO)).resolves.toEqual(SONG);
++    expect(deps.searchSongs).not.toHaveBeenCalled();
++    // YouTube's own pair, both ways round: the only case a time map exists for.
++    expect(pairedWith(VIDEO.videoId)).toBe(SONG.videoId);
++    expect(pairedWith(SONG.videoId)).toBe(VIDEO.videoId);
++  });
++
++  it('leaves a song alone when its own row is the catalogue cut', async () => {
++    const deps = sources({ findCuts: vi.fn(async () => ({ self: cut(SONG, false), other: cut(VIDEO, true) })) });
++    const { resolveAudio } = createVersionResolver(deps);
++
++    await expect(resolveAudio(SONG)).resolves.toEqual(SONG);
++    expect(deps.searchSongs).not.toHaveBeenCalled();
++  });
++
++  it('searches the title and artist when YouTube pairs nothing, and takes the real recording', async () => {
++    const deps = sources({
++      searchSongs: vi.fn(async () => [
++        track('cover', 'Kesariya', 'Some Cover Band', 268),
++        track('slow', 'Kesariya (Slowed + Reverb)', 'Arijit Singh', 300),
++        SONG,
++      ]),
++    });
++    const { resolveAudio } = createVersionResolver(deps);
++
++    await expect(resolveAudio(VIDEO)).resolves.toEqual(SONG);
++    // The packaging is not put to a search box; the artist and the title are.
++    expect(vi.mocked(deps.searchSongs).mock.calls[0]?.[0]).toBe('kesariya arijit singh');
++  });
++
++  it('walks the queries in order and stops at the first that matches', async () => {
++    const searchSongs = vi
++      .fn<(query: string) => Promise<Track[]>>()
++      .mockResolvedValueOnce([])
++      .mockResolvedValueOnce([SONG]);
++    const deps = sources({ searchSongs, findCuts: vi.fn(async () => { throw new Error('offline'); }) });
++    const { resolveAudio } = createVersionResolver(deps);
++
++    await expect(resolveAudio(VIDEO)).resolves.toEqual(SONG);
++    expect(searchSongs.mock.calls.map(([query]) => query)).toEqual(['kesariya arijit singh', 'kesariya']);
++  });
++
++  it('takes an official song that runs far shorter than the video, once the search has it', async () => {
++    // A video with a spoken intro: over a minute longer than its release, so
++    // the ordinary matcher must refuse it and the switch's own must not.
++    const long = track('vid2', 'Kesariya - Brahmastra | Official Video', 'Arijit Singh', 340);
++    const deps = sources({ searchSongs: vi.fn(async () => [track('song2', 'Kesariya', 'Arijit Singh', 200)]) });
++    const { resolveAudio } = createVersionResolver(deps);
++
++    await expect(resolveAudio(long)).resolves.toMatchObject({ videoId: 'song2' });
++  });
++
++  it('keeps the video when no search answers with the song', async () => {
++    const deps = sources({
++      searchSongs: vi.fn(async () => [track('cover', 'Kesariya', 'Some Cover Band', 268)]),
++    });
++    const { resolveAudio } = createVersionResolver(deps);
++
++    await expect(resolveAudio(VIDEO)).resolves.toEqual(VIDEO);
++    // Answered, so it is remembered: the next play asks nothing.
++    const calls = vi.mocked(deps.searchSongs).mock.calls.length;
++    await expect(resolveAudio(VIDEO)).resolves.toEqual(VIDEO);
++    expect(vi.mocked(deps.searchSongs).mock.calls.length).toBe(calls);
++  });
++
++  it('does not remember a miss that came of a failed search', async () => {
++    const deps = sources({ searchSongs: vi.fn(async () => Promise.reject(new Error('offline'))) });
++    const { resolveAudio } = createVersionResolver(deps);
++
++    await expect(resolveAudio(VIDEO)).resolves.toEqual(VIDEO);
++    const calls = vi.mocked(deps.searchSongs).mock.calls.length;
++    await expect(resolveAudio(VIDEO)).resolves.toEqual(VIDEO);
++    expect(vi.mocked(deps.searchSongs).mock.calls.length).toBeGreaterThan(calls);
++  });
++});
++
++describe('resolveVideo', () => {
++  const audio = track('song1', 'Kesariya', 'Arijit Singh', 268, 'Brahmastra');
++
++  it('takes YouTube’s pair without searching', async () => {
++    const deps = sources({ findCuts: vi.fn(async () => ({ self: cut(audio, false), other: cut(VIDEO, true) })) });
++    const { resolveVideo } = createVersionResolver(deps);
++
++    await expect(resolveVideo(audio)).resolves.toEqual(VIDEO);
++    expect(deps.searchVideos).not.toHaveBeenCalled();
++  });
++
++  it('searches videos when YouTube pairs nothing', async () => {
++    const deps = sources({ searchVideos: vi.fn(async () => [VIDEO]) });
++    const { resolveVideo } = createVersionResolver(deps);
++
++    await expect(resolveVideo(audio)).resolves.toEqual(VIDEO);
++    expect(vi.mocked(deps.searchVideos).mock.calls[0]?.[0]).toBe('kesariya arijit singh');
++  });
++
++  it('answers null when there is no video, and remembers it', async () => {
++    const deps = sources();
++    const { resolveVideo } = createVersionResolver(deps);
++
++    await expect(resolveVideo(audio)).resolves.toBeNull();
++    const calls = vi.mocked(deps.searchVideos).mock.calls.length;
++    await expect(resolveVideo(audio)).resolves.toBeNull();
++    expect(vi.mocked(deps.searchVideos).mock.calls.length).toBe(calls);
++  });
++
++  it('refuses a video of another song, or of the same song by someone else', async () => {
++    const deps = sources({
++      searchVideos: vi.fn(async () => [
++        track('other', 'Raataan Lambiyan - Shershaah | Official Video', 'Jubin Nautiyal', 271),
++        track('cover', 'Kesariya - Cover', 'Some Cover Band', 268),
++      ]),
++    });
++    const { resolveVideo } = createVersionResolver(deps);
++
++    await expect(resolveVideo(audio)).resolves.toBeNull();
++  });
++});
+diff --git a/web/app/src/data/music/versions.ts b/web/app/src/data/music/versions.ts
+new file mode 100644
+index 0000000..f01b3e2
+--- /dev/null
++++ b/web/app/src/data/music/versions.ts
+@@ -0,0 +1,204 @@
++/**
++ * The other cut of a track, as the app looks it up: YouTube Music's own
++ * pairing when it offers one, otherwise a search (YtMusicRepository's
++ * resolveAudio / resolveVideo / officialVersion).
++ *
++ * The pair is asked for first because it is an answer rather than a guess: a
++ * search can land on a same-titled cover or a different release, the pair
++ * cannot. Signed out, YouTube pairs nothing at all, and the search below is
++ * the only way through — which is why the phone's own docs say so
++ * (InnertubeParser.parseVersionPair) and Android falls back to a search.
++ *
++ * Split out of api.ts so the decision flow can be tested with a mocked
++ * search: the caches are per-resolver, and api.ts owns the one the app uses.
++ */
++
++import type { Cut } from '@/data/music/api';
++import type { Track } from '@/data/music/types';
++import { best, bestOfficialAudioForVideo, queries, targetOf, type MatchCandidate, type MatchTarget } from '@/data/match/trackMatcher';
++import { trackLog } from '@/playback/trackLog';
++
++/** What a resolver asks YouTube for; api.ts binds these to the real calls. */
++export interface VersionSources {
++  /** Both cuts of [videoId]'s track from its watch queue, as YouTube pairs them. */
++  findCuts(videoId: string): Promise<{ self: Cut; other: Cut | null } | null>;
++  searchSongs(query: string): Promise<Track[]>;
++  searchVideos(query: string): Promise<Track[]>;
++}
++
++export interface VersionResolver {
++  /**
++   * [track] heard as its catalogue song: itself when it is already one, the
++   * pair's song when YouTube pairs it, otherwise the best song a search on
++   * the title and artist answers with. The same track when nothing better
++   * turns up — playing the video's own audio beats guessing at a substitute.
++   */
++  resolveAudio(track: Track): Promise<Track>;
++  /** The music video of [track], or null when none turns up. The inverse of [resolveAudio]. */
++  resolveVideo(track: Track): Promise<Track | null>;
++  /**
++   * The cut YouTube itself pairs with [videoId], or null when it paired
++   * nothing (or the lookup has not run). Only a pair YouTube made carries a
++   * time map, so this is what says whether asking for one is worth a request.
++   */
++  pairedWith(videoId: string): string | null;
++}
++
++/** A search result, plus the row it came from, so the winner can be given back as a Track. */
++interface Candidate extends MatchCandidate {
++  track: Track;
++}
++
++const asCandidate = (track: Track): Candidate => ({
++  track,
++  title: track.title,
++  artist: track.artists.map((artist) => artist.name).join(', '),
++  durationSec: track.durationSec,
++  album: track.album?.name ?? null,
++  explicit: track.explicit,
++});
++
++const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
++
++/** What the pair lookup turned up, before any search. */
++type PairLookup = { state: 'other'; other: Cut } | { state: 'already' } | { state: 'none' };
++
++export function createVersionResolver(sources: VersionSources): VersionResolver {
++  /** Songs already found (or confirmed missing) for a video, as on the phone. */
++  const audioCache = new Map<string, Track>();
++  /** Videos found for a song; null is a real answer — there was nothing to find. */
++  const videoCache = new Map<string, Track | null>();
++  /** The counterpart YouTube itself paired with each cut it was asked about. */
++  const pairs = new Map<string, string>();
++
++  /**
++   * YtMusicRepository.officialVersion: what [track] is paired with by YouTube
++   * Music itself, as the cut [wantAudio] asks for. A failed lookup and an
++   * absent pair are both 'none', because both fall through to the search.
++   */
++  async function pairFor(track: Track, wantAudio: boolean): Promise<PairLookup> {
++    let pair: { self: Cut; other: Cut | null } | null;
++    try {
++      pair = await sources.findCuts(track.videoId);
++    } catch (error) {
++      trackLog.w(`version pair lookup failed for '${track.title}': ${describe(error)}`, track.videoId);
++      return { state: 'none' };
++    }
++    if (!pair) {
++      trackLog.d(`version pair: YouTube pairs nothing with '${track.title}'`, track.videoId);
++      return { state: 'none' };
++    }
++    // Which cut YouTube paired it with, both ways round: only a pair it made
++    // carries a time map, so this is what says whether asking for one is worth
++    // a request. (InnertubeParser.parseVersionPair's own bookkeeping.)
++    if (pair.other) {
++      pairs.set(track.videoId, pair.other.track.videoId);
++      pairs.set(pair.other.track.videoId, track.videoId);
++    }
++    // The row's own cut is the kind the track already is: nothing to switch to.
++    if (pair.self.isVideo === !wantAudio) {
++      trackLog.d(`version pair: '${track.title}' is already the ${wantAudio ? 'song' : 'video'}`, track.videoId);
++      return { state: 'already' };
++    }
++    if (!pair.other) {
++      trackLog.d(`version pair: '${track.title}' has no ${wantAudio ? 'song' : 'video'} paired with it`, track.videoId);
++      return { state: 'none' };
++    }
++    trackLog.i(`version pair: '${track.title}' -> '${pair.other.track.title}' (${pair.other.track.videoId})`, track.videoId);
++    return { state: 'other', other: pair.other };
++  }
++
++  /**
++   * The best of one search's answer: the ordinary matcher first, then the
++   * looser one the manual switch runs on, which accepts a video's visual
++   * intro or outro as a difference in runtime rather than in recording.
++   */
++  function pick(candidates: Track[], target: MatchTarget): Track | null {
++    const scored = candidates.map(asCandidate);
++    const exact = best(scored, target);
++    if (exact) return exact.track;
++    const drifted = bestOfficialAudioForVideo(scored, target);
++    if (drifted) return drifted.track;
++    return null;
++  }
++
++  return {
++    pairedWith: (videoId) => pairs.get(videoId) ?? null,
++
++    async resolveAudio(track) {
++      const cached = audioCache.get(track.videoId);
++      if (cached) return cached;
++
++      const pair = await pairFor(track, true);
++      if (pair.state === 'already') return track;
++      if (pair.state === 'other') {
++        audioCache.set(track.videoId, pair.other.track);
++        return pair.other.track;
++      }
++
++      const target = targetOf({ ...track, isVideo: true });
++      let searchFailed = false;
++      for (const query of queries(target)) {
++        trackLog.d(`audio switch: searching songs for '${query}'`, track.videoId);
++        let candidates: Track[];
++        try {
++          candidates = await sources.searchSongs(query);
++        } catch (error) {
++          // A search that failed says nothing about the song, so it must not
++          // be remembered as "this video has no song".
++          searchFailed = true;
++          trackLog.w(`audio switch: song search failed for '${query}': ${describe(error)}`, track.videoId);
++          continue;
++        }
++        const match = pick(candidates, target);
++        if (match) {
++          trackLog.i(`audio switch: '${track.title}' -> '${match.title}' (${query})`, track.videoId);
++          audioCache.set(track.videoId, match);
++          return match;
++        }
++        trackLog.d(`audio switch: no match among ${candidates.length} for '${query}'`, track.videoId);
++      }
++      trackLog.w(`audio switch: no official song match for '${track.title}' by '${target.artist ?? ''}'`, track.videoId);
++      if (!searchFailed) audioCache.set(track.videoId, track);
++      return track;
++    },
++
++    async resolveVideo(track) {
++      if (videoCache.has(track.videoId)) return videoCache.get(track.videoId) ?? null;
++
++      const pair = await pairFor(track, false);
++      if (pair.state === 'already') {
++        videoCache.set(track.videoId, null);
++        return null;
++      }
++      if (pair.state === 'other') {
++        videoCache.set(track.videoId, pair.other.track);
++        return pair.other.track;
++      }
++
++      const target = targetOf({ ...track, isVideo: false });
++      let searchFailed = false;
++      for (const query of queries(target)) {
++        trackLog.d(`video switch: searching videos for '${query}'`, track.videoId);
++        let candidates: Track[];
++        try {
++          candidates = await sources.searchVideos(query);
++        } catch (error) {
++          searchFailed = true;
++          trackLog.w(`video switch: video search failed for '${query}': ${describe(error)}`, track.videoId);
++          continue;
++        }
++        const match = best(candidates.map(asCandidate), target);
++        if (match) {
++          trackLog.i(`video switch: '${track.title}' -> '${match.track.title}' (${query})`, track.videoId);
++          videoCache.set(track.videoId, match.track);
++          return match.track;
++        }
++        trackLog.d(`video switch: no match among ${candidates.length} for '${query}'`, track.videoId);
++      }
++      trackLog.w(`video switch: no video match for '${track.title}' by '${target.artist ?? ''}'`, track.videoId);
++      if (!searchFailed) videoCache.set(track.videoId, null);
++      return null;
++    },
++  };
++}
+diff --git a/web/app/src/lyrics/am-lyrics-translation.test.ts b/web/app/src/lyrics/am-lyrics-translation.test.ts
+new file mode 100644
+index 0000000..58905a7
+--- /dev/null
++++ b/web/app/src/lyrics/am-lyrics-translation.test.ts
+@@ -0,0 +1,57 @@
++// @vitest-environment happy-dom
++/**
++ * am-lyrics against the document we write: the second language has to come out
++ * as its own line under the main one, from `showTranslation` alone and with no
++ * request of the library's own. This is the library's parser doing the reading,
++ * not ours — if the shape drifts, this fails even though the strings match.
++ */
++import '@uimaxbai/am-lyrics/am-lyrics.js';
++import { describe, expect, it } from 'vitest';
++import { layoutTtml } from './layout';
++import { line } from './model';
++
++type LyricsElement = HTMLElement & {
++  ttml?: string;
++  showTranslation?: boolean;
++  noAutoAlternates?: boolean;
++  updateComplete?: Promise<unknown>;
++  shadowRoot: ShadowRoot;
++};
++
++const original = [line(1_000, 'Hello there'), line(3_000, 'We were young')];
++const translated = [line(1_000, 'سلام دنیا'), line(3_000, 'ما جوان بودیم')];
++
++async function render(layout: 'original-first' | 'translation-first'): Promise<LyricsElement> {
++  const { ttml } = layoutTtml(original, translated, layout, { source: 'en', target: 'fa' });
++  const el = document.createElement('am-lyrics') as LyricsElement;
++  el.ttml = ttml;
++  // What the panel sets: both languages are already in the document.
++  el.noAutoAlternates = true;
++  el.showTranslation = true;
++  document.body.append(el);
++  await el.updateComplete;
++  await new Promise((resolve) => setTimeout(resolve, 50));
++  return el;
++}
++
++const mains = (el: LyricsElement) =>
++  [...el.shadowRoot.querySelectorAll('.main-vocal-container')].map((node) => node.textContent?.trim());
++
++const seconds = (el: LyricsElement) =>
++  [...el.shadowRoot.querySelectorAll('.lyrics-translation-container')].map((node) => node.textContent?.trim());
++
++describe('am-lyrics with both languages', () => {
++  it('draws the translation under the original', async () => {
++    const el = await render('original-first');
++    expect(mains(el)).toEqual(['Hello there', 'We were young']);
++    expect(seconds(el)).toEqual(['سلام دنیا', 'ما جوان بودیم']);
++  });
++
++  it('draws the original under the translation, as the right-to-left lyric', async () => {
++    const el = await render('translation-first');
++    expect(mains(el)).toEqual(['سلام دنیا', 'ما جوان بودیم']);
++    expect(seconds(el)).toEqual(['Hello there', 'We were young']);
++    // The bold line is Persian, so the library itself marks it right to left.
++    expect(el.shadowRoot.querySelector('.lyrics-line.rtl-text')).not.toBeNull();
++  });
++}, 30_000);
+diff --git a/web/app/src/lyrics/layout.test.ts b/web/app/src/lyrics/layout.test.ts
+new file mode 100644
+index 0000000..69a9f43
+--- /dev/null
++++ b/web/app/src/lyrics/layout.test.ts
+@@ -0,0 +1,133 @@
++// @vitest-environment happy-dom
++/**
++ * The two-language documents: which line is the bold one, which is the line
++ * under it, and that neither loses a timing. am-lyrics reads the second
++ * language only from `<text for>`/`itunes:key`, so that mapping is what these
++ * check — plus the three layouts' one difference, which version is the main one.
++ */
++import { describe, expect, it } from 'vitest';
++import { layoutTtml } from './layout';
++import { line, type LyricLine, type LyricWord } from './model';
++
++const word = (text: string, startMs: number, endMs: number): LyricWord => ({ text, startMs, endMs, syllables: [] });
++
++/** Two sung lines, an instrumental stretch, a line without words, and a line both languages share. */
++const original: LyricLine[] = [
++  line(1_000, 'Hello there', { words: [word('Hello', 1_000, 1_400), word('there', 1_400, 1_800)] }),
++  line(2_000, ''),
++  line(3_000, 'Not a word'),
++  line(4_000, 'Same', { words: [word('Same', 4_000, 4_500)] }),
++];
++
++/** The same song in Persian: same positions, same timings, same blank. */
++const translated: LyricLine[] = [
++  line(1_000, 'سلام دنیا', { words: [word('سلام', 1_000, 1_400), word('دنیا', 1_400, 1_800)] }),
++  line(2_000, ''),
++  line(3_000, 'یک کلمه نیست'),
++  line(4_000, 'Same'),
++];
++
++const laid = (layout: 'original-first' | 'translation-first' | 'translation-only', from = 'en', to = 'fa') =>
++  layoutTtml(original, translated, layout, { source: from, target: to });
++
++const keysOf = (ttml: string) => [...ttml.matchAll(/itunes:key="([^"]+)"/g)].map((match) => match[1]!);
++const targetsOf = (ttml: string) => [...ttml.matchAll(/<text for="([^"]+)"/g)].map((match) => match[1]!);
++
++describe('original-first', () => {
++  const { ttml, rtl, secondaryRtl, bilingual } = laid('original-first');
++
++  it('keeps the original as the main line, word timings and all', () => {
++    expect(ttml).toContain('xml:lang="en"');
++    expect(ttml).toContain('<p begin="1.000" end="1.800" itunes:key="L1">');
++    expect(ttml).toContain('<span begin="1.000" end="1.400">Hello</span> <span begin="1.400" end="1.800">there</span>');
++    expect(ttml).not.toContain('سلام دنیا</span>');
++  });
++
++  it('puts the translation under each line, in its own language', () => {
++    expect(ttml).toContain('<translation xml:lang="fa">');
++    expect(ttml).toContain('<text for="L1">سلام دنیا</text>');
++    expect(ttml).toContain('<text for="L2">یک کلمه نیست</text>');
++    expect(bilingual).toBe(true);
++    expect(rtl).toBe(false);
++    expect(secondaryRtl).toBe(true);
++  });
++
++  it('leaves the instrumental stretch out of both languages', () => {
++    expect(ttml.match(/<p /g)).toHaveLength(3);
++    expect(targetsOf(ttml)).toEqual(['L1', 'L2']);
++    expect(keysOf(ttml)).toEqual(['L1', 'L2', 'L3']);
++  });
++
++  it('says nothing under a line that reads the same in both languages', () => {
++    expect(ttml).not.toContain('<text for="L3">');
++    // The shared line is still the bold one, timed as it was.
++    expect(ttml).toContain('<p begin="4.000" end="4.500" itunes:key="L3">');
++  });
++
++  it('maps every translation to a paragraph am-lyrics will find', () => {
++    const document = new DOMParser().parseFromString(ttml, 'text/xml');
++    expect(document.getElementsByTagName('parsererror')).toHaveLength(0);
++    const paragraphs = new Set(keysOf(ttml));
++    for (const target of targetsOf(ttml)) expect(paragraphs.has(target)).toBe(true);
++    // What the panel reads: the same `getElementsByTagName` walk it does.
++    const texts = document.getElementsByTagName('translation')[0]!.getElementsByTagName('text');
++    expect(Array.from(texts).map((node) => [node.getAttribute('for'), node.textContent])).toEqual([
++      ['L1', 'سلام دنیا'],
++      ['L2', 'یک کلمه نیست'],
++    ]);
++  });
++});
++
++describe('translation-first', () => {
++  const { ttml, rtl, secondaryRtl, bilingual } = laid('translation-first');
++
++  it('makes the translation the main line, with the timing it was given', () => {
++    expect(ttml).toContain('xml:lang="fa"');
++    expect(ttml).toContain('<p begin="1.000" end="1.800" itunes:key="L1">');
++    expect(ttml).toContain('<span begin="1.000" end="1.400">سلام</span> <span begin="1.400" end="1.800">دنیا</span>');
++    expect(rtl).toBe(true);
++    expect(secondaryRtl).toBe(false);
++    expect(bilingual).toBe(true);
++  });
++
++  it('puts the original under it', () => {
++    expect(ttml).toContain('<translation xml:lang="en">');
++    expect(ttml).toContain('<text for="L1">Hello there</text>');
++    expect(ttml).toContain('<text for="L2">Not a word</text>');
++  });
++
++  it('leaves the same blanks blank', () => {
++    expect(ttml.match(/<p /g)).toHaveLength(3);
++    expect(targetsOf(ttml)).toEqual(['L1', 'L2']);
++  });
++});
++
++describe('translation-only', () => {
++  const { ttml, rtl, bilingual } = laid('translation-only');
++
++  it('is the document the panel showed before there were two languages', () => {
++    expect(ttml).not.toContain('<translations>');
++    expect(ttml).not.toContain('itunes:key');
++    expect(ttml).toContain('xml:lang="fa"');
++    expect(ttml).toContain('<p begin="1.000" end="1.800"><span begin="1.000" end="1.400">سلام</span>');
++    expect(bilingual).toBe(false);
++    expect(rtl).toBe(true);
++  });
++
++  it('keeps the blank out of the document', () => {
++    expect(ttml.match(/<p /g)).toHaveLength(3);
++  });
++});
++
++describe('untimed lyrics', () => {
++  it('still lets each paragraph carry its translation', () => {
++    const plain = [line(0, 'One'), line(0, ''), line(0, 'Two')];
++    const sameInPersian = [line(0, 'یک'), line(0, ''), line(0, 'دو')];
++    const { ttml } = layoutTtml(plain, sameInPersian, 'original-first', { source: 'en', target: 'fa' });
++    expect(ttml).toContain('itunes:timing="None"');
++    expect(ttml).toContain('<p itunes:key="L1">One</p>');
++    expect(ttml).toContain('<text for="L2">دو</text>');
++    // The blank line is not a paragraph, so it never takes a key.
++    expect(ttml.match(/<p /g)).toHaveLength(2);
++  });
++});
+diff --git a/web/app/src/lyrics/layout.ts b/web/app/src/lyrics/layout.ts
+new file mode 100644
+index 0000000..8387b2c
+--- /dev/null
++++ b/web/app/src/lyrics/layout.ts
+@@ -0,0 +1,84 @@
++import type { LyricLine } from './model';
++import { isRtl } from './translation';
++import { writeTtml } from './ttml';
++
++/**
++ * How the two languages are stacked while the translate button is on.
++ *
++ * - `original-first`: the lyric as it is sung, bold, with the translation
++ *   under it (what Apple Music shows).
++ * - `translation-first`: the translation is the lyric, bold and sweeping, and
++ *   the original sits under it.
++ * - `translation-only`: the translated lyric replaces the original, which is
++ *   how the panel worked before there were two languages.
++ *
++ * am-lyrics draws both of the first two itself: the main line is bold and
++ * sweeps with its word timings, the `<text for>` lines are the smaller, dimmer
++ * line under it (`showTranslation`). No second element, no per-frame work.
++ */
++export type TranslationLayout = 'original-first' | 'translation-first' | 'translation-only';
++
++export const TRANSLATION_LAYOUTS: { id: TranslationLayout; label: string }[] = [
++  { id: 'original-first', label: 'Original bold, translation below' },
++  { id: 'translation-first', label: 'Translation bold, original below' },
++  { id: 'translation-only', label: 'Translation only' },
++];
++
++export const DEFAULT_TRANSLATION_LAYOUT: TranslationLayout = 'original-first';
++
++export function isTranslationLayout(value: unknown): value is TranslationLayout {
++  return TRANSLATION_LAYOUTS.some((layout) => layout.id === value);
++}
++
++export function translationLayoutLabel(layout: TranslationLayout): string {
++  return TRANSLATION_LAYOUTS.find((entry) => entry.id === layout)?.label ?? layout;
++}
++
++export interface LaidOutLyrics {
++  /** What am-lyrics renders. */
++  ttml: string;
++  /** Whether the main line reads right to left (the panel's `dir`). */
++  rtl: boolean;
++  /** Whether the line under it reads right to left (Persian under an English lyric). */
++  secondaryRtl: boolean;
++  /** Whether the document carries a second language am-lyrics should draw. */
++  bilingual: boolean;
++}
++
++/** A line's lead text, when it says anything: a blank line is an instrumental stretch. */
++function leadOf(lines: LyricLine[], index: number): string | undefined {
++  const text = lines[index]?.text.trim();
++  return text ? text : undefined;
++}
++
++/**
++ * The TTML for one layout, from both versions of the same song.
++ *
++ * [translated] is [original] with the text replaced (translation.ts'
++ * `rebuildLines`), so the two arrays are line for line: same positions, same
++ * timings, same blanks. Whichever one is the main line keeps its own word
++ * timings, which is what makes the sweep follow the vocal in either language;
++ * the other one is only text, mapped to its line by key.
++ */
++export function layoutTtml(
++  original: LyricLine[],
++  translated: LyricLine[],
++  layout: TranslationLayout,
++  { source, target }: { source: string; target: string },
++): LaidOutLyrics {
++  const translationFirst = layout === 'translation-first';
++  // The old document, unchanged: no keys, no second language.
++  if (layout === 'translation-only') {
++    return { ttml: writeTtml(translated, target), rtl: isRtl(target), secondaryRtl: false, bilingual: false };
++  }
++  const main = translationFirst ? translated : original;
++  const under = translationFirst ? original : translated;
++  const mainLanguage = translationFirst ? target : source;
++  const secondaryLanguage = translationFirst ? source : target;
++  return {
++    ttml: writeTtml(main, mainLanguage, { language: secondaryLanguage, texts: main.map((_, index) => leadOf(under, index)) }),
++    rtl: isRtl(mainLanguage),
++    secondaryRtl: isRtl(secondaryLanguage),
++    bilingual: true,
++  };
++}
+diff --git a/web/app/src/lyrics/settings.ts b/web/app/src/lyrics/settings.ts
+index 0fef966..2909902 100644
+--- a/web/app/src/lyrics/settings.ts
++++ b/web/app/src/lyrics/settings.ts
+@@ -1,5 +1,11 @@
+ import { create } from 'zustand';
++import {
++  DEFAULT_TRANSLATION_LAYOUT,
++  isTranslationLayout,
++  type TranslationLayout,
++} from './layout';
+ import { LYRICS_SOURCES, orderedSources, type LyricsSourceId } from './sources';
++import { defaultTargetLanguage } from './translation';
+ 
+ /**
+  * Which lyric providers are asked, and in what order (the desktop's lyric
+@@ -13,15 +19,24 @@ interface LyricsSettings {
+   preferSyllables: boolean;
+   /** PaxSenix's Spotify and Musixmatch routes need the user's own key. */
+   paxsenixKey: string;
++  /** The language the lyrics translate into: the browser's, until the user picks another. */
++  translateTo: string;
++  /** How the two languages are stacked while the translation is showing. */
++  translationLayout: TranslationLayout;
+   setEnabled: (id: LyricsSourceId, on: boolean) => void;
+   move: (id: LyricsSourceId, by: -1 | 1) => void;
+   setPreferSyllables: (on: boolean) => void;
+   setPaxsenixKey: (key: string) => void;
++  setTranslateTo: (language: string) => void;
++  setTranslationLayout: (layout: TranslationLayout) => void;
+   reset: () => void;
+ }
+ 
+ const KEY = 'bitchord:lyrics';
+-type Saved = Pick<LyricsSettings, 'order' | 'disabled' | 'preferSyllables' | 'paxsenixKey'>;
++type Saved = Pick<
++  LyricsSettings,
++  'order' | 'disabled' | 'preferSyllables' | 'paxsenixKey' | 'translateTo' | 'translationLayout'
++>;
+ 
+ const DEFAULTS: Saved = {
+   order: LYRICS_SOURCES.map((s) => s.id),
+@@ -29,12 +44,24 @@ const DEFAULTS: Saved = {
+   disabled: ['paxsenix-spotify', 'paxsenix-musixmatch'],
+   preferSyllables: false,
+   paxsenixKey: '',
++  translateTo: defaultTargetLanguage(),
++  translationLayout: DEFAULT_TRANSLATION_LAYOUT,
+ };
+ 
+ function load(): Saved {
+   try {
+     const saved = JSON.parse(localStorage.getItem(KEY) ?? '{}') as Partial<Saved>;
+-    return { ...DEFAULTS, ...saved, order: orderedSources(saved.order ?? DEFAULTS.order) };
++    return {
++      ...DEFAULTS,
++      ...saved,
++      order: orderedSources(saved.order ?? DEFAULTS.order),
++      // A browser language outside the picker is still a real destination; only a blank one falls back.
++      translateTo: saved.translateTo?.trim() || DEFAULTS.translateTo,
++      // A layout saved by a build that knew others is not this build's.
++      translationLayout: isTranslationLayout(saved.translationLayout)
++        ? saved.translationLayout
++        : DEFAULTS.translationLayout,
++    };
+   } catch {
+     return DEFAULTS;
+   }
+@@ -43,8 +70,11 @@ function load(): Saved {
+ export const useLyricsSettings = create<LyricsSettings>()((set, get) => {
+   const save = (change: Partial<Saved>) => {
+     set(change);
+-    const { order, disabled, preferSyllables, paxsenixKey } = get();
+-    localStorage.setItem(KEY, JSON.stringify({ order, disabled, preferSyllables, paxsenixKey }));
++    const { order, disabled, preferSyllables, paxsenixKey, translateTo, translationLayout } = get();
++    localStorage.setItem(
++      KEY,
++      JSON.stringify({ order, disabled, preferSyllables, paxsenixKey, translateTo, translationLayout }),
++    );
+   };
+   return {
+     ...load(),
+@@ -59,6 +89,8 @@ export const useLyricsSettings = create<LyricsSettings>()((set, get) => {
+     },
+     setPreferSyllables: (preferSyllables) => save({ preferSyllables }),
+     setPaxsenixKey: (paxsenixKey) => save({ paxsenixKey: paxsenixKey.trim() }),
++    setTranslateTo: (translateTo) => save({ translateTo: translateTo.trim() || defaultTargetLanguage() }),
++    setTranslationLayout: (translationLayout) => save({ translationLayout }),
+     reset: () => save(DEFAULTS),
+   };
+ });
+diff --git a/web/app/src/lyrics/translation.test.ts b/web/app/src/lyrics/translation.test.ts
+new file mode 100644
+index 0000000..0c5b263
+--- /dev/null
++++ b/web/app/src/lyrics/translation.test.ts
+@@ -0,0 +1,201 @@
++// @vitest-environment happy-dom
++import { describe, expect, it } from 'vitest';
++import { line, type LyricLine } from './model';
++import {
++  batchesOf,
++  cacheKey,
++  flattenLines,
++  forgetTranslations,
++  isRtl,
++  MAX_BATCH_CHARS,
++  normalizeLanguage,
++  parseGtxResponse,
++  payloadOf,
++  projectWords,
++  rebuildLines,
++  sameLanguage,
++  splitByMarkers,
++  translateLyrics,
++  type TextSlot,
++} from './translation';
++
++/** The shape `translate_a/single` answers with: segments in `[0]`, detected language in `[2]`. */
++const gtx = (body: string, source = 'en') => [[[body, 'translation', null, null, 10]], null, source, null, null, null, 0.9];
++
++const slot = (text: string, lineIndex = 0, background = false): TextSlot => ({ lineIndex, background, text, sectionHeader: false });
++
++function echoFetch(seen: string[]) {
++  return (async (_url: string, init?: RequestInit) => {
++    const payload = String((init?.body as URLSearchParams).get('q'));
++    seen.push(payload);
++    // An identity "translation": the endpoint hands the payload back with its markers intact.
++    return { ok: true, status: 200, json: async () => gtx(payload) };
++  }) as unknown as typeof fetch;
++}
++
++describe('translation batching (LyricsTranslation.kt)', () => {
++  it('keeps every batch within 3,500 characters and every slot in order', () => {
++    const slots = Array.from({ length: 40 }, (_, index) => slot('x'.repeat(200), index));
++    const batches = batchesOf(slots);
++    expect(batches.length).toBeGreaterThan(1);
++    for (const batch of batches) {
++      expect(batch.payload.length).toBeLessThanOrEqual(MAX_BATCH_CHARS);
++      expect(payloadOf(batch.slots)).toBe(batch.payload);
++    }
++    expect(batches.flatMap((batch) => batch.slots)).toEqual(slots);
++  });
++
++  it('moves a slot that would overflow onto the next batch, and starts with a 3,500-char one', () => {
++    const slots = [slot('a'.repeat(3_000)), slot('b'.repeat(400)), slot('c'.repeat(500))];
++    const batches = batchesOf(slots);
++    // 3000, then +8+400, then +8+500 would be 3516: the last slot goes on its own.
++    expect(batches.map((batch) => batch.slots.length)).toEqual([2, 1]);
++    expect(batches[0]!.payload.length).toBe(3_408);
++    expect(batches[1]!.payload).toBe('c'.repeat(500));
++  });
++
++  it('round-trips a payload through the private-use markers', () => {
++    const slots = [slot('first line'), slot('[Chorus]'.slice(1, -1), 1), slot('(ooh)', 1, true)];
++    expect(splitByMarkers(payloadOf(slots))).toEqual(['first line', 'Chorus', '(ooh)']);
++  });
++
++  it('leaves blank lines out and keeps section labels and background vocals as their own slots', () => {
++    const lines: LyricLine[] = [
++      line(0, ''),
++      line(1_000, 'Hello there'),
++      line(2_000, '[Verse 2]'),
++      line(3_000, 'Lead', { background: line(3_000, '(answer)') }),
++    ];
++    expect(flattenLines(lines)).toEqual([
++      { lineIndex: 1, background: false, text: 'Hello there', sectionHeader: false },
++      { lineIndex: 2, background: false, text: 'Verse 2', sectionHeader: true },
++      { lineIndex: 3, background: false, text: 'Lead', sectionHeader: false },
++      { lineIndex: 3, background: true, text: '(answer)', sectionHeader: false },
++    ]);
++  });
++});
++
++describe('translation response parsing', () => {
++  it('joins segments and reads the detected language', () => {
++    const body = `Hola\n\uE0000001\uE001\nmundo`;
++    const parsed = parseGtxResponse(gtx(body, 'en'), 2);
++    expect(parsed).toEqual({ texts: ['Hola', 'mundo'], source: 'en' });
++  });
++
++  it('joins a body split across several segments', () => {
++    const root = [[['Hola\n', 'Hola\n'], ['\uE0000001\uE001\nmundo', '\uE0000001\uE001\nmundo']], null, 'en'];
++    expect(parseGtxResponse(root, 2)).toEqual({ texts: ['Hola', 'mundo'], source: 'en' });
++  });
++
++  it('rejects a partial answer rather than mapping it onto the wrong lines', () => {
++    expect(parseGtxResponse(gtx('solo texto'), 2)).toBeNull();
++    expect(parseGtxResponse(gtx('a\n\uE0000001\uE001\n'), 2)).toBeNull();
++    expect(parseGtxResponse({ error: 'nope' }, 1)).toBeNull();
++    expect(parseGtxResponse([], 1)).toBeNull();
++  });
++});
++
++describe('language tags', () => {
++  it('normalizes base tags and the legacy aliases', () => {
++    expect(normalizeLanguage('en-US')).toBe('en');
++    expect(normalizeLanguage('iw_IL')).toBe('he');
++    expect(normalizeLanguage('in')).toBe('id');
++    expect(sameLanguage('he', 'iw')).toBe(true);
++    expect(sameLanguage('en', 'es')).toBe(false);
++  });
++
++  it('knows which destinations run right to left', () => {
++    expect(isRtl('fa')).toBe(true);
++    expect(isRtl('ar-EG')).toBe(true);
++    expect(isRtl('en')).toBe(false);
++  });
++});
++
++describe('timing reconstruction', () => {
++  const source: LyricLine = line(1_000, 'hold on tight', {
++    sungUntilMs: 5_000,
++    words: [
++      { startMs: 1_000, endMs: 3_000, text: 'hold', syllables: [] },
++      { startMs: 3_000, endMs: 3_400, text: 'on', syllables: [] },
++      { startMs: 3_400, endMs: 5_000, text: 'tight', syllables: [] },
++    ],
++  });
++
++  it('keeps every line in place, with its end and background placement', () => {
++    const lines: LyricLine[] = [line(0, ''), source, line(6_000, 'Lead', { background: line(6_100, '(ooh)') })];
++    const slots = flattenLines(lines);
++    const rebuilt = rebuildLines(
++      lines,
++      slots,
++      slots.map((s) => `t:${s.text}`),
++    );
++    expect(rebuilt.map((l) => l.timeMs)).toEqual([0, 1_000, 6_000]);
++    expect(rebuilt[0]!.text).toBe('');
++    expect(rebuilt[1]!.sungUntilMs).toBe(5_000);
++    expect(rebuilt[1]!.text).toBe('t:hold on tight');
++    expect(rebuilt[2]!.background?.text).toBe('t:(ooh)');
++    expect(rebuilt[2]!.background?.timeMs).toBe(6_100);
++  });
++
++  it('projects the source pace onto the translated words, within the line bounds', () => {
++    const words = projectWords(source, 'aguenta firme agora');
++    expect(words.map((w) => w.text)).toEqual(['aguenta', 'firme', 'agora']);
++    expect(words[0]!.startMs).toBe(1_000);
++    expect(words.at(-1)!.endMs).toBe(5_000);
++    // The long "hold" holds its translated share for longer than the short "on".
++    expect(words[0]!.endMs - words[0]!.startMs).toBeGreaterThan(words[1]!.endMs - words[1]!.startMs);
++    for (const [index, word] of words.entries()) {
++      expect(word.endMs).toBeGreaterThanOrEqual(word.startMs);
++      if (index > 0) expect(word.startMs).toBeGreaterThanOrEqual(words[index - 1]!.endMs);
++    }
++  });
++
++  it('re-brackets a translated section label', () => {
++    const lines = [line(0, '[Chorus]')];
++    expect(rebuildLines(lines, flattenLines(lines), ['Refrão'])[0]!.text).toBe('[Refrão]');
++  });
++});
++
++describe('translateLyrics', () => {
++  it('batches once, then answers from the cache without a request', async () => {
++    forgetTranslations();
++    const seen: string[] = [];
++    const lines = [line(0, 'one'), line(1_000, 'two')];
++    const first = await translateLyrics({ videoId: 'cache-song', lines, target: 'es', fetchImpl: echoFetch(seen) });
++    expect(first.kind).toBe('translated');
++    expect(seen).toHaveLength(1);
++    const second = await translateLyrics({ videoId: 'cache-song', lines, target: 'es', fetchImpl: echoFetch(seen) });
++    expect(second).toMatchObject({ kind: 'translated', fromCache: true });
++    expect(seen).toHaveLength(1);
++    // A different destination is a different entry.
++    expect(cacheKey('cache-song', 'es', flattenLines(lines))).not.toBe(cacheKey('cache-song', 'fa', flattenLines(lines)));
++  });
++
++  it('reports the source language when nothing needed translating', async () => {
++    forgetTranslations();
++    const lines = [line(0, 'hola')];
++    const result = await translateLyrics({ videoId: 'same-song', lines, target: 'en', fetchImpl: echoFetch([]) });
++    expect(result).toEqual({ kind: 'same', language: 'en' });
++  });
++
++  it('keeps the original when the request fails', async () => {
++    forgetTranslations();
++    const failing = (async () => ({ ok: false, status: 500, json: async () => null })) as unknown as typeof fetch;
++    const result = await translateLyrics({ videoId: 'fail-song', lines: [line(0, 'hola')], target: 'fa', fetchImpl: failing });
++    expect(result).toEqual({ kind: 'failed', reason: 'network' });
++  });
++
++  it('stops when the caller cancels', async () => {
++    forgetTranslations();
++    const controller = new AbortController();
++    controller.abort();
++    const result = await translateLyrics({
++      videoId: 'cancel-song',
++      lines: [line(0, 'hola')],
++      target: 'fa',
++      signal: controller.signal,
++      fetchImpl: echoFetch([]),
++    });
++    expect(result).toEqual({ kind: 'failed', reason: 'cancelled' });
++  });
++});
+diff --git a/web/app/src/lyrics/translation.ts b/web/app/src/lyrics/translation.ts
+new file mode 100644
+index 0000000..9bae3ff
+--- /dev/null
++++ b/web/app/src/lyrics/translation.ts
+@@ -0,0 +1,505 @@
++import { isSectionHeader, type LyricLine, type LyricWord } from './model';
++
++/**
++ * On-demand lyric translation: a port of LyricsTranslation.kt.
++ *
++ * Google's lightweight web endpoint answers a whole batch of lines at once, so
++ * a song costs one or two requests rather than one per line. Nothing is
++ * installed and no key is needed; the endpoint sends
++ * `access-control-allow-origin: *`, so the page itself can call it.
++ *
++ * - Blank (instrumental) lines are never sent and stay in place.
++ * - Section labels and background vocals are separate slots, translated on
++ *   their own so a `[Chorus]` is not glued to the line under it.
++ * - Slots are batched up to 3,500 characters with a private-use marker between
++ *   them (`\uE0000001\uE001`), which is how the answer is mapped back to lines
++ *   exactly: the response is split on the markers, and a count mismatch throws
++ *   the whole answer away.
++ * - At most two requests run at a time; each has a 12 s deadline and is
++ *   cancelled when the track, the lyrics or the destination language changes.
++ * - Timings survive: translated lines are rebuilt from the originals, so
++ *   timeMs, sungUntilMs, background placement and list position are untouched.
++ */
++
++export const ENDPOINT = 'https://translate.googleapis.com/translate_a/single';
++export const MAX_BATCH_CHARS = 3_500;
++export const MAX_PARALLEL_REQUESTS = 2;
++export const REQUEST_TIMEOUT_MS = 12_000;
++/** Bumped when the cached shape or the batching changes, so old answers are ignored. */
++export const CACHE_VERSION = 1;
++const MEMORY_ENTRIES = 12;
++const MAX_CACHE_BYTES = 2 * 1024 * 1024;
++const STORE_KEY = 'bitchord:lyrics-translation';
++
++// ---- Languages --------------------------------------------------------------------------
++
++export interface Language {
++  code: string;
++  label: string;
++}
++
++/** The destination languages the picker offers, alphabetical by name. */
++export const LANGUAGES: Language[] = [
++  { code: 'ar', label: 'Arabic' },
++  { code: 'bn', label: 'Bengali' },
++  { code: 'zh', label: 'Chinese (Simplified)' },
++  { code: 'cs', label: 'Czech' },
++  { code: 'da', label: 'Danish' },
++  { code: 'nl', label: 'Dutch' },
++  { code: 'en', label: 'English' },
++  { code: 'fa', label: 'Persian' },
++  { code: 'fil', label: 'Filipino' },
++  { code: 'fi', label: 'Finnish' },
++  { code: 'fr', label: 'French' },
++  { code: 'de', label: 'German' },
++  { code: 'el', label: 'Greek' },
++  { code: 'he', label: 'Hebrew' },
++  { code: 'hi', label: 'Hindi' },
++  { code: 'hu', label: 'Hungarian' },
++  { code: 'id', label: 'Indonesian' },
++  { code: 'it', label: 'Italian' },
++  { code: 'ja', label: 'Japanese' },
++  { code: 'ko', label: 'Korean' },
++  { code: 'ms', label: 'Malay' },
++  { code: 'no', label: 'Norwegian' },
++  { code: 'pl', label: 'Polish' },
++  { code: 'pt', label: 'Portuguese' },
++  { code: 'ro', label: 'Romanian' },
++  { code: 'ru', label: 'Russian' },
++  { code: 'es', label: 'Spanish' },
++  { code: 'sv', label: 'Swedish' },
++  { code: 'th', label: 'Thai' },
++  { code: 'tr', label: 'Turkish' },
++  { code: 'uk', label: 'Ukrainian' },
++  { code: 'ur', label: 'Urdu' },
++  { code: 'vi', label: 'Vietnamese' },
++];
++
++/** Scripts written right to left, so the panel can mirror the layout. */
++const RTL_LANGUAGES = new Set(['ar', 'arc', 'ckb', 'dv', 'fa', 'he', 'iw', 'ji', 'ps', 'sd', 'ug', 'ur', 'yi']);
++
++/**
++ * A language tag's base subtag, with the legacy aliases Android and the web
++ * still hand out (iw→he, in→id, ji→yi). Comparison only: a destination such as
++ * `zh-CN` is sent as given, because narrowing it to `zh` would hand back
++ * Simplified when Traditional was asked for.
++ */
++export function normalizeLanguage(tag: string): string {
++  const base = (tag.replace(/_/g, '-').split('-')[0] ?? '').toLowerCase();
++  if (base === 'iw') return 'he';
++  if (base === 'in') return 'id';
++  if (base === 'ji') return 'yi';
++  return base;
++}
++
++export function sameLanguage(first: string, second: string): boolean {
++  return normalizeLanguage(first) === normalizeLanguage(second) && normalizeLanguage(first) !== '';
++}
++
++export function isRtl(tag: string): boolean {
++  return RTL_LANGUAGES.has(normalizeLanguage(tag));
++}
++
++export function languageLabel(tag: string): string {
++  const base = normalizeLanguage(tag);
++  return LANGUAGES.find((l) => l.code === base)?.label ?? (base ? base.toUpperCase() : 'English');
++}
++
++/** The app has no locale picker of its own, so the destination starts at the browser's language. */
++export function defaultTargetLanguage(): string {
++  const tag = typeof navigator === 'undefined' ? '' : navigator.language;
++  return normalizeLanguage(tag || 'en') || 'en';
++}
++
++// ---- Batching ---------------------------------------------------------------------------
++
++/** One piece of text to translate: a line's lead, or its background vocal. */
++export interface TextSlot {
++  lineIndex: number;
++  background: boolean;
++  text: string;
++  sectionHeader: boolean;
++}
++
++export interface Batch {
++  slots: TextSlot[];
++  payload: string;
++}
++
++/**
++ * The lines as text slots, in order, skipping blanks. A `[Chorus]` loses its
++ * brackets in the request (so it reads as words, not code) and gets them back
++ * when the answer is rebuilt.
++ */
++export function flattenLines(lines: LyricLine[]): TextSlot[] {
++  const slots: TextSlot[] = [];
++  lines.forEach((line, lineIndex) => {
++    if (line.text.trim()) {
++      const header = isSectionHeader(line.text);
++      slots.push({
++        lineIndex,
++        background: false,
++        text: header ? line.text.replace(/^\[/, '').replace(/\]$/, '').trim() : line.text,
++        sectionHeader: header,
++      });
++    }
++    const backing = line.background;
++    if (backing && backing.text.trim()) {
++      slots.push({ lineIndex, background: true, text: backing.text, sectionHeader: false });
++    }
++  });
++  return slots;
++}
++
++/** The marker between two slots: 6 characters, so a separator costs 8 (`\n` + marker + `\n`). */
++export function marker(index: number): string {
++  return `\uE000${String(index).padStart(4, '0')}\uE001`;
++}
++
++const SEPARATOR_CHARS = 8;
++
++export function payloadOf(slots: TextSlot[]): string {
++  return slots.map((slot, index) => (index > 0 ? `\n${marker(index)}\n${slot.text}` : slot.text)).join('');
++}
++
++/** Splits an answer on the markers; the parts line up with the batch's slots. */
++export function splitByMarkers(body: string): string[] {
++  return body.split(/\uE000[^\uE001]*\uE001/).map((part) => part.trim());
++}
++
++/** Groups slots into payloads no longer than [MAX_BATCH_CHARS], never splitting a slot. */
++export function batchesOf(slots: TextSlot[]): Batch[] {
++  const batches: Batch[] = [];
++  let current: TextSlot[] = [];
++  let length = 0;
++  const flush = () => {
++    if (!current.length) return;
++    batches.push({ slots: current, payload: payloadOf(current) });
++    current = [];
++    length = 0;
++  };
++  for (const slot of slots) {
++    const added = slot.text.length + (current.length ? SEPARATOR_CHARS : 0);
++    if (current.length && length + added > MAX_BATCH_CHARS) flush();
++    current.push(slot);
++    length += added;
++  }
++  flush();
++  return batches;
++}
++
++/** The `translate_a/single` answer: segments joined, detected language from `root[2]`. */
++export interface GtxAnswer {
++  texts: string[];
++  source: string;
++}
++
++export function parseGtxResponse(root: unknown, expectedSlots: number): GtxAnswer | null {
++  if (!Array.isArray(root)) return null;
++  const segments = root[0];
++  if (!Array.isArray(segments)) return null;
++  const body = segments
++    .map((segment) => (Array.isArray(segment) && typeof segment[0] === 'string' ? (segment[0] as string) : ''))
++    .join('');
++  const texts = splitByMarkers(body);
++  // A partial or reordered answer would put the wrong words on the wrong
++  // timestamps; the original lines are better than a mis-mapping.
++  if (texts.length !== expectedSlots || texts.some((text) => !text)) return null;
++  const source = typeof root[2] === 'string' ? root[2] : '';
++  return { texts, source };
++}
++
++interface BatchAnswer extends GtxAnswer {
++  sourceWeight: number;
++}
++
++async function requestBatch(
++  batch: Batch,
++  target: string,
++  { signal, fetchImpl }: { signal?: AbortSignal; fetchImpl: typeof fetch },
++): Promise<BatchAnswer | null> {
++  const body = new URLSearchParams({
++    client: 'dict-chrome-ex',
++    sl: 'auto',
++    tl: target,
++    dt: 't',
++    q: batch.payload,
++  });
++  // A form POST with no custom headers is a simple request, so it skips the
++  // CORS preflight the endpoint does not answer.
++  const controller = new AbortController();
++  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
++  const cancel = () => controller.abort();
++  signal?.addEventListener('abort', cancel, { once: true });
++  try {
++    const response = await fetchImpl(ENDPOINT, {
++      method: 'POST',
++      body,
++      headers: { Accept: 'application/json' },
++      signal: controller.signal,
++      referrerPolicy: 'no-referrer',
++    });
++    if (!response.ok) return null;
++    const parsed = parseGtxResponse(await response.json(), batch.slots.length);
++    return parsed ? { ...parsed, sourceWeight: batch.payload.length } : null;
++  } catch {
++    return null;
++  } finally {
++    clearTimeout(timer);
++    signal?.removeEventListener('abort', cancel);
++  }
++}
++
++// ---- Rebuilding -------------------------------------------------------------------------
++
++/**
++ * A word-synced line's source holds, pauses and pace changes, projected onto
++ * the translated text: the translated tokens take their share of the source
++ * character timeline, so the sweep speeds up and holds with the original
++ * vocal instead of running evenly. This is an approximate reading aid, not
++ * word alignment in the target language.
++ */
++export function projectWords(source: LyricLine, translated: string): LyricWord[] {
++  const words = source.words;
++  if (!words.length || !translated) return [];
++  const spans = words.map((word) => ({
++    start: word.startMs,
++    end: Math.max(word.startMs, word.endMs),
++    chars: Math.max(1, word.text.length),
++  }));
++  const total = spans.reduce((sum, span) => sum + span.chars, 0);
++  const timeAt = (position: number): number => {
++    const at = Math.min(Math.max(position, 0), total);
++    let base = 0;
++    for (const span of spans) {
++      if (at <= base + span.chars) return Math.round(span.start + (span.end - span.start) * ((at - base) / span.chars));
++      base += span.chars;
++    }
++    return spans[spans.length - 1]!.end;
++  };
++  const tokens = translated.match(/\S+/g) ?? [translated];
++  const length = Math.max(1, translated.length);
++  const out: LyricWord[] = [];
++  let cursor = 0;
++  for (const token of tokens) {
++    const index = translated.indexOf(token, cursor);
++    const from = index < 0 ? cursor : index;
++    cursor = from + token.length;
++    const previousEnd = out[out.length - 1]?.endMs ?? 0;
++    const startMs = Math.max(timeAt((total * from) / length), previousEnd);
++    const endMs = Math.max(startMs, timeAt((total * cursor) / length));
++    out.push({ startMs, endMs, text: token, syllables: [] });
++  }
++  return out;
++}
++
++/**
++ * The originals with their translated text and the same timings: every line
++ * keeps its position, its end, its answering vocal and its alignment.
++ */
++export function rebuildLines(original: LyricLine[], slots: TextSlot[], texts: string[]): LyricLine[] {
++  const leads = new Map<number, { text: string; section: boolean }>();
++  const backs = new Map<number, string>();
++  slots.forEach((slot, index) => {
++    const text = texts[index] ?? slot.text;
++    if (slot.background) backs.set(slot.lineIndex, text);
++    else leads.set(slot.lineIndex, { text, section: slot.sectionHeader });
++  });
++  return original.map((line, index) => {
++    const lead = leads.get(index);
++    const backing = backs.get(index);
++    const text = lead ? (lead.section ? `[${lead.text}]` : lead.text) : line.text;
++    const background = line.background
++      ? {
++          ...line.background,
++          text: backing ?? line.background.text,
++          words:
++            backing && line.background.words.length
++              ? projectWords(line.background, backing)
++              : line.background.words,
++        }
++      : null;
++    return {
++      ...line,
++      text,
++      words: lead && text !== line.text && line.words.length ? projectWords(line, text) : line.words,
++      background,
++    };
++  });
++}
++
++// ---- Cache ------------------------------------------------------------------------------
++
++interface CachedTranslation {
++  version: number;
++  source: string;
++  target: string;
++  texts: string[];
++  /** When it was last used, for trimming the persisted store. */
++  at: number;
++}
++
++const memory = new Map<string, CachedTranslation>();
++
++function rememberInMemory(key: string, entry: CachedTranslation) {
++  memory.delete(key);
++  memory.set(key, entry);
++  while (memory.size > MEMORY_ENTRIES) memory.delete(memory.keys().next().value!);
++}
++
++let store: Record<string, CachedTranslation> | null = null;
++
++function persisted(): Record<string, CachedTranslation> {
++  if (store) return store;
++  store = {};
++  try {
++    const raw = typeof localStorage === 'undefined' ? null : localStorage.getItem(STORE_KEY);
++    const parsed = raw ? (JSON.parse(raw) as Record<string, CachedTranslation>) : {};
++    if (parsed && typeof parsed === 'object') store = parsed;
++  } catch {
++    store = {};
++  }
++  return store;
++}
++
++function persist() {
++  const entries = persisted();
++  try {
++    let json = JSON.stringify(entries);
++    while (json.length > MAX_CACHE_BYTES) {
++      const oldest = Object.entries(entries).sort((a, b) => (a[1].at ?? 0) - (b[1].at ?? 0))[0];
++      if (!oldest) break;
++      delete entries[oldest[0]];
++      json = JSON.stringify(entries);
++    }
++    localStorage.setItem(STORE_KEY, json);
++  } catch {
++    // A full or unavailable store costs speed, not correctness.
++  }
++}
++
++/** FNV-1a twice over, as a 64-bit hex key: a cache key needs to be cheap, not cryptographic. */
++function hashKey(input: string): string {
++  let first = 0x811c9dc5;
++  let second = 0x9e3779b9;
++  for (let index = 0; index < input.length; index++) {
++    const code = input.charCodeAt(index);
++    first = Math.imul(first ^ code, 0x01000193);
++    second = Math.imul(second ^ code, 0x85ebca6b);
++  }
++  return (first >>> 0).toString(16).padStart(8, '0') + (second >>> 0).toString(16).padStart(8, '0');
++}
++
++/** Hash of track, destination and the source text, so a new provider's lyrics get their own entry. */
++export function cacheKey(videoId: string, target: string, slots: TextSlot[]): string {
++  return hashKey([CACHE_VERSION, videoId, target, ...slots.map((slot) => slot.text)].join('\u0000'));
++}
++
++function readCache(key: string): CachedTranslation | null {
++  const hot = memory.get(key);
++  if (hot && hot.version === CACHE_VERSION) {
++    rememberInMemory(key, hot);
++    return hot;
++  }
++  const cold = persisted()[key];
++  if (!cold || cold.version !== CACHE_VERSION) return null;
++  cold.at = Date.now();
++  rememberInMemory(key, cold);
++  return cold;
++}
++
++function writeCache(key: string, entry: CachedTranslation) {
++  rememberInMemory(key, entry);
++  persisted()[key] = entry;
++  persist();
++}
++
++/** Drops every remembered translation: tests, and a "clear cache" that has to start clean. */
++export function forgetTranslations() {
++  memory.clear();
++  store = {};
++  try {
++    if (typeof localStorage !== 'undefined') localStorage.removeItem(STORE_KEY);
++  } catch {
++    // Nothing to forget.
++  }
++}
++
++// ---- Translation ------------------------------------------------------------------------
++
++export type TranslationResult =
++  | { kind: 'translated'; lines: LyricLine[]; sourceLanguage: string; fromCache: boolean }
++  | { kind: 'same'; language: string }
++  | { kind: 'failed'; reason: 'empty' | 'network' | 'malformed' | 'cancelled' };
++
++export interface TranslateOptions {
++  videoId: string;
++  lines: LyricLine[];
++  target: string;
++  signal?: AbortSignal;
++  fetchImpl?: typeof fetch;
++}
++
++/**
++ * The lines in [target], with their timings. Cancelling is reported as
++ * `cancelled` rather than a failure so the panel can ignore it.
++ */
++export async function translateLyrics({
++  videoId,
++  lines,
++  target: requested,
++  signal,
++  fetchImpl = fetch,
++}: TranslateOptions): Promise<TranslationResult> {
++  const target = requested.trim();
++  if (!target || !lines.length) return { kind: 'failed', reason: 'empty' };
++  const slots = flattenLines(lines);
++  if (!slots.length) return { kind: 'failed', reason: 'empty' };
++
++  const key = cacheKey(videoId, target, slots);
++  const cached = readCache(key);
++  if (cached && cached.texts.length === slots.length) {
++    return sameLanguage(cached.source, target)
++      ? { kind: 'same', language: cached.source }
++      : {
++          kind: 'translated',
++          lines: rebuildLines(lines, slots, cached.texts),
++          sourceLanguage: cached.source,
++          fromCache: true,
++        };
++  }
++
++  const batches = batchesOf(slots);
++  const answers: (BatchAnswer | null)[] = [];
++  for (let index = 0; index < batches.length; index += MAX_PARALLEL_REQUESTS) {
++    const group = batches.slice(index, index + MAX_PARALLEL_REQUESTS);
++    answers.push(...(await Promise.all(group.map((batch) => requestBatch(batch, target, { signal, fetchImpl })))));
++    if (signal?.aborted) return { kind: 'failed', reason: 'cancelled' };
++  }
++  if (answers.some((answer) => answer === null)) return { kind: 'failed', reason: 'network' };
++
++  const complete = answers as BatchAnswer[];
++  const detected = new Map<string, number>();
++  for (const answer of complete) {
++    const language = normalizeLanguage(answer.source);
++    if (!language) continue;
++    detected.set(language, (detected.get(language) ?? 0) + answer.sourceWeight);
++  }
++  let source = '';
++  let weight = 0;
++  for (const [language, value] of detected) {
++    if (value > weight) {
++      source = language;
++      weight = value;
++    }
++  }
++  if (!source) return { kind: 'failed', reason: 'malformed' };
++
++  const texts = complete.flatMap((answer) => answer.texts);
++  if (texts.length !== slots.length) return { kind: 'failed', reason: 'malformed' };
++
++  writeCache(key, { version: CACHE_VERSION, source, target, texts, at: Date.now() });
++  return sameLanguage(source, target)
++    ? { kind: 'same', language: source }
++    : { kind: 'translated', lines: rebuildLines(lines, slots, texts), sourceLanguage: source, fromCache: false };
++}
+diff --git a/web/app/src/lyrics/ttml.ts b/web/app/src/lyrics/ttml.ts
+index 3b412b1..658bdd8 100644
+--- a/web/app/src/lyrics/ttml.ts
++++ b/web/app/src/lyrics/ttml.ts
+@@ -15,6 +15,11 @@ import { isGap, type LyricLine, type LyricWord } from './model';
+  * - Duets: two voices, `v1` (a person) and `v2` (typed "other", so a song that
+  *   opens on the answering side starts on the right), which am-lyrics lays
+  *   out with the same alternation rule as LyricAlignments.kt.
++ * - A second language, in Apple's shape: every `<p>` carries `itunes:key`, and
++ *   `<iTunesMetadata><translations><translation xml:lang>` holds one
++ *   `<text for>` per line. That mapping is the only one am-lyrics reads
++ *   (`showTranslation`), and it draws the mapped text as a smaller line under
++ *   the main one. Lines with nothing to add get no `<text>` at all.
+  */
+ 
+ const escape = (text: string) =>
+@@ -38,35 +43,67 @@ function spansOf(words: LyricWord[]): string {
+     .join(' ');
+ }
+ 
+-export function writeTtml(lines: LyricLine[], language = 'en'): string {
+-  const sung = lines.filter((l) => !isGap(l));
+-  const timed = sung.some((l) => l.timeMs > 0 || l.words.length);
+-  const wordTimed = sung.some((l) => l.words.length);
+-  const duet = sung.some((l) => l.alignment === 'end');
++/** The line under each main line, and the language it is written in. */
++export interface SecondaryText {
++  /** A BCP 47 tag: `fa`, `en`, `zh-CN`. */
++  language: string;
++  /** One entry per line of the document's lines; `undefined` for a line with nothing under it. */
++  texts: (string | undefined)[];
++}
++
++export function writeTtml(lines: LyricLine[], language = 'en', secondary?: SecondaryText): string {
++  // A blank line is an instrumental stretch: it is am-lyrics' spacing, not a
++  // lyric, so it never becomes a paragraph (and never takes a key).
++  const sung = lines.map((line, index) => ({ line, index })).filter(({ line }) => !isGap(line));
++  const list = sung.map((entry) => entry.line);
++  const timed = list.some((l) => l.timeMs > 0 || l.words.length);
++  const wordTimed = list.some((l) => l.words.length);
++  const duet = list.some((l) => l.alignment === 'end');
++
++  const translated = secondary
++    ? sung
++        .map(({ line, index }, position) => {
++          const text = secondary.texts[index]?.trim();
++          // A line that already reads that way in the other language has nothing to add.
++          if (!text || text === line.text.trim()) return '';
++          return `<text for="L${position + 1}">${escape(text)}</text>`;
++        })
++        .filter(Boolean)
++    : [];
++  // Keys exist for the translations to hang off; with no translation to show,
++  // the document stays exactly as it was before there were two languages.
++  const keyOf = (position: number) =>
++    translated.length ? ` itunes:key="L${position + 1}"` : '';
+ 
+-  const paragraphs = sung.map((l, index) => {
++  const paragraphs = sung.map(({ line: l }, position) => {
+     const agent = duet ? ` ttm:agent="${l.alignment === 'end' ? 'v2' : 'v1'}"` : '';
+-    if (!timed) return `<p${agent}>${escape(l.text)}</p>`;
+-    const next = sung[index + 1]?.timeMs;
++    const key = keyOf(position);
++    if (!timed) return `<p${key}${agent}>${escape(l.text)}</p>`;
++    const next = list[position + 1]?.timeMs;
+     if (l.words.length) {
+       const lastEnd = Math.max(l.words.at(-1)!.endMs, l.background?.words.at(-1)?.endMs ?? 0);
+       const background = l.background?.words.length
+         ? ` <span ttm:role="x-bg">${spansOf(l.background.words)}</span>`
+         : '';
+-      return `<p begin="${clock(l.timeMs)}" end="${clock(lastEnd)}"${agent}>${spansOf(l.words)}${background}</p>`;
++      return `<p begin="${clock(l.timeMs)}" end="${clock(lastEnd)}"${key}${agent}>${spansOf(l.words)}${background}</p>`;
+     }
+     // A line-timed answering vocal has no timing of its own to hang under the
+     // lead, so it stays in the line, as the provider wrote it.
+     const text = l.background ? `${l.text} ${l.background.text}` : l.text;
+     const end = l.sungUntilMs ?? next ?? l.timeMs + 5000;
+-    return `<p begin="${clock(l.timeMs)}" end="${clock(Math.max(end, l.timeMs))}"${agent}>${escape(text)}</p>`;
++    return `<p begin="${clock(l.timeMs)}" end="${clock(Math.max(end, l.timeMs))}"${key}${agent}>${escape(text)}</p>`;
+   });
+ 
+   const agents = duet ? '<ttm:agent type="person" xml:id="v1"/><ttm:agent type="other" xml:id="v2"/>' : '';
++  const translations = translated.length
++    ? `<iTunesMetadata xmlns="http://music.apple.com/lyric-ttml-internal"><translations>` +
++      `<translation xml:lang="${escape(secondary!.language)}">${translated.join('')}</translation>` +
++      `</translations></iTunesMetadata>`
++    : '';
+   return (
+     `<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata" ` +
+     `xmlns:itunes="http://music.apple.com/lyric-ttml-internal" xml:lang="${escape(language)}" ` +
+     `itunes:timing="${wordTimed ? 'Word' : timed ? 'Line' : 'None'}">` +
+-    `<head><metadata>${agents}</metadata></head><body><div>${paragraphs.join('')}</div></body></tt>`
++    `<head><metadata>${agents}${translations}</metadata></head><body><div>${paragraphs.join('')}</div></body></tt>`
+   );
+ }
+diff --git a/web/app/src/lyrics/useTranslation.ts b/web/app/src/lyrics/useTranslation.ts
+new file mode 100644
+index 0000000..6c4b8fd
+--- /dev/null
++++ b/web/app/src/lyrics/useTranslation.ts
+@@ -0,0 +1,136 @@
++import { useCallback, useEffect, useMemo, useState } from 'react';
++import { create } from 'zustand';
++import { layoutTtml } from './layout';
++import type { LyricLine } from './model';
++import type { LyricsResult } from './repository';
++import { useLyricsSettings } from './settings';
++import { languageLabel, translateLyrics } from './translation';
++
++/**
++ * Which version the panel is showing, as `videoId|destination`: kept outside
++ * the component so opening the full-screen player (or closing it) does not
++ * quietly put the original back, as the phone's player doesn't.
++ */
++const useTranslatedChoice = create<{ token: string | null; setToken: (token: string | null) => void }>((set) => ({
++  token: null,
++  setToken: (token) => set({ token }),
++}));
++
++/**
++ * The panel's translated view: which version is showing, what the request is
++ * doing, and the one short message its failures leave behind.
++ *
++ * A change of track, lyrics or destination language cancels the request in
++ * flight (the effect's cleanup aborts it), so an answer for the last song can
++ * never land on this one. A second toggle is answered from the cache, with no
++ * request at all. The layout is applied to the answer here, so switching
++ * between `original-first`, `translation-first` and `translation-only` never
++ * asks Google anything.
++ */
++export interface LyricsTranslation {
++  /** Whether the translated version is the one on screen. */
++  showing: boolean;
++  /** Whether there are any lyrics to translate. */
++  available: boolean;
++  pending: boolean;
++  notice: string | null;
++  /** The TTML for the current destination and layout, once it is ready. */
++  ttml: string | null;
++  /** Whether the main line is right to left. */
++  rtl: boolean;
++  /** Whether the line under it is right to left (Persian under an English lyric). */
++  secondaryRtl: boolean;
++  /** Whether am-lyrics should draw the second line (i.e. every layout but `translation-only`). */
++  bilingual: boolean;
++  target: string;
++  setTarget: (language: string) => void;
++  toggle: () => void;
++}
++
++interface Ready {
++  /** The destination it was translated into, so a language change never shows the old one. */
++  target: string;
++  /** The same lines, in that language, with their timings. */
++  lines: LyricLine[];
++  /** The language they were translated from, as Google detected it. */
++  source: string;
++}
++
++export function useLyricsTranslation(result: LyricsResult | null | undefined, videoId: string): LyricsTranslation {
++  const target = useLyricsSettings((s) => s.translateTo);
++  const setTarget = useLyricsSettings((s) => s.setTranslateTo);
++  const layout = useLyricsSettings((s) => s.translationLayout);
++  const token = `${videoId}|${target}`;
++  const chosen = useTranslatedChoice((s) => s.token);
++  const setToken = useTranslatedChoice((s) => s.setToken);
++  const [pending, setPending] = useState(false);
++  const [notice, setNotice] = useState<string | null>(null);
++  const [ready, setReady] = useState<Ready | null>(null);
++  const showing = !!result && !!videoId && chosen === token;
++
++  // New lyrics mean the text in hand belongs to another song.
++  useEffect(() => {
++    setReady(null);
++  }, [result]);
++
++  useEffect(() => {
++    if (!showing || !result) return;
++    const controller = new AbortController();
++    setPending(true);
++    setNotice(null);
++    const fail = (message: string) => {
++      setNotice(message);
++      setToken(null);
++    };
++    translateLyrics({ videoId, lines: result.lines, target, signal: controller.signal })
++      .then((outcome) => {
++        if (controller.signal.aborted) return;
++        if (outcome.kind === 'translated') {
++          setReady({ target, lines: outcome.lines, source: outcome.sourceLanguage });
++        } else if (outcome.kind === 'same') {
++          fail(`Already in ${languageLabel(outcome.language)}.`);
++        } else if (outcome.reason !== 'cancelled') {
++          fail('Translation is unavailable right now. Showing the original lyrics.');
++        }
++      })
++      .catch(() => {
++        if (!controller.signal.aborted) fail('Translation is unavailable right now. Showing the original lyrics.');
++      })
++      .finally(() => {
++        if (!controller.signal.aborted) setPending(false);
++      });
++    return () => controller.abort();
++  }, [showing, result, videoId, target, setToken]);
++
++  // Composed from the answer already in hand: a layout change is a re-render, not a request.
++  // Gated on `showing`: with the translation off the panel gets no document from
++  // here and falls back to the original, which is the whole point of the toggle.
++  const current = showing && ready && ready.target === target ? ready : null;
++  const laid = useMemo(
++    () =>
++      current && result
++        ? layoutTtml(result.lines, current.lines, layout, { source: current.source, target })
++        : null,
++    [current, result, layout, target],
++  );
++
++  const toggle = useCallback(() => {
++    if (!result) return;
++    setNotice(null);
++    setToken(showing ? null : token);
++  }, [result, showing, token, setToken]);
++
++  return {
++    showing: showing && !!laid,
++    available: !!result,
++    pending,
++    notice,
++    ttml: laid?.ttml ?? null,
++    rtl: laid?.rtl ?? false,
++    secondaryRtl: laid?.secondaryRtl ?? false,
++    bilingual: laid?.bilingual ?? false,
++    target,
++    setTarget,
++    toggle,
++  };
++}
+diff --git a/web/app/src/pages/SettingsPage.tsx b/web/app/src/pages/SettingsPage.tsx
+index 7c52b8c..d1d596b 100644
+--- a/web/app/src/pages/SettingsPage.tsx
++++ b/web/app/src/pages/SettingsPage.tsx
+@@ -12,6 +12,7 @@ import { useHistorySettings } from '@/playback/historyReporting';
+ import { Select } from '@/components/Select';
+ import { AUTOMIX_BARS } from '@/playback/automix/choices';
+ import { CROSSFADE_CHOICES, usePlayer } from '@/state/player';
++import { useMusicOnly } from '@/state/musicOnly';
+ import { AppleMusicIntegration, AppleMusicToggles, CanvasToggle, DiscordIntegration, LyricSourcesAccess, SpotifyIntegration, Toggle } from './IntegrationSettings';
+ import { settingsUi } from './settingsStyles';
+ 
+@@ -63,6 +64,8 @@ export default function SettingsPage() {
+   const automix = usePlayer((s) => s.automix);
+   const automixBars = usePlayer((s) => s.automixBars);
+   const showNerdStats = usePlayer((s) => s.showNerdStats);
++  const preferMusicOnly = useMusicOnly((s) => s.preferMusicOnly);
++  const setPreferMusicOnly = useMusicOnly((s) => s.setPreferMusicOnly);
+   const shareHistory = useHistorySettings((s) => s.share);
+   const setShareHistory = useHistorySettings((s) => s.setShare);
+   const { setAutoplay, setCrossfade, setAutomix, setAutomixBars, setShowNerdStats } = usePlayer.getState();
+@@ -146,6 +149,12 @@ export default function SettingsPage() {
+             checked={autoplay}
+             onChange={setAutoplay}
+           />
++          <Toggle
++            label="Prefer song over music video"
++            detail="Music videos play as their album song. You can still switch from the player menu."
++            checked={preferMusicOnly}
++            onChange={setPreferMusicOnly}
++          />
+           <label className={settingsUi.controlRow}>
+             <span>Crossfade</span>
+             <Select<number | 'automix'>
+diff --git a/web/app/src/shell/AppShell.tsx b/web/app/src/shell/AppShell.tsx
+index 4ea40e6..611498a 100644
+--- a/web/app/src/shell/AppShell.tsx
++++ b/web/app/src/shell/AppShell.tsx
+@@ -13,6 +13,7 @@ import { useUi } from '@/state/ui';
+ import { useKeyboardShortcuts } from './useKeyboardShortcuts';
+ import { Banner, bannerButtonClass } from './Banner';
+ import { MobileTopBar } from './MobileTopBar';
++import { Notice } from './Notice';
+ import { PlayerBar } from './PlayerBar';
+ import { SidePanel } from './SidePanel';
+ import { Sidebar } from './Sidebar';
+@@ -96,6 +97,7 @@ export function AppShell() {
+           <FullScreenPlayer />
+         </Suspense>
+       )}
++      <Notice />
+     </div>
+   );
+ }
+diff --git a/web/app/src/shell/LyricsPanel.test.tsx b/web/app/src/shell/LyricsPanel.test.tsx
+new file mode 100644
+index 0000000..ed123de
+--- /dev/null
++++ b/web/app/src/shell/LyricsPanel.test.tsx
+@@ -0,0 +1,172 @@
++// @vitest-environment happy-dom
++/**
++ * The panel's translation wiring: the toggle beside the source credit asks for
++ * a translation once, swaps the TTML am-lyrics renders, and puts the original
++ * back without a second request. The providers, the player and the extension
++ * are all stubbed — this is about the panel, not about where lyrics come from.
++ */
++import { act } from 'react';
++import { createRoot } from 'react-dom/client';
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { line } from '@/lyrics/model';
++
++const lyricsResult = {
++  source: 'lrclib' as const,
++  label: 'LRCLIB',
++  lines: [line(0, 'Hello there'), line(2_000, ''), line(3_000, 'We were young')],
++  ttml: '<tt>original</tt>',
++  wordSynced: false,
++  synced: true,
++};
++
++vi.mock('@uimaxbai/am-lyrics/am-lyrics.js', () => ({}));
++vi.mock('@/data/spotify/canvas', () => ({ useCanvas: () => null }));
++vi.mock('@/extension/bridge', () => ({ getBridge: () => null }));
++vi.mock('@/lyrics/http', () => ({
++  onUngrantedChange: () => () => {},
++  ungrantedOrigins: new Set<string>(),
++  onGranted: () => () => {},
++  recheckGrants: async () => {},
++}));
++vi.mock('@/lyrics/useLyrics', () => ({
++  useLyrics: () => ({ data: lyricsResult, isPending: false, fetchStatus: 'idle', isFetching: false }),
++  useLyricsUi: (select: (state: unknown) => unknown) => select({ picked: {}, states: {}, pick: () => {} }),
++}));
++vi.mock('@/state/player', () => ({
++  usePlayer: (select: (state: unknown) => unknown) =>
++    select({
++      nowPlaying: { videoId: 'vid1', title: 'Song', artist: 'Someone' },
++      deck: null,
++      mixing: false,
++      status: 'paused',
++      queue: [],
++      index: 0,
++      seek: () => {},
++    }),
++  getAudio: () => null,
++  getPlayhead: () => null,
++}));
++
++const { LyricsPanel } = await import('./LyricsPanel');
++const { useLyricsSettings } = await import('@/lyrics/settings');
++const { forgetTranslations } = await import('@/lyrics/translation');
++
++/** Renders the side panel and returns its host element. */
++async function renderPanel(target: string, layout: 'original-first' | 'translation-first' | 'translation-only' = 'translation-only') {
++  useLyricsSettings.setState({ translateTo: target, translationLayout: layout });
++  const host = document.createElement('div');
++  document.body.append(host);
++  const root = createRoot(host);
++  await act(async () => root.render(<LyricsPanel />));
++  return { host, root };
++}
++
++describe('LyricsPanel translation', () => {
++  const requests: string[] = [];
++
++  beforeEach(() => {
++    requests.length = 0;
++    // Answers are cached per track and language; each test starts from none.
++    forgetTranslations();
++    // Emptying the test's own body between renders; no page content is involved.
++    document.body.innerHTML = '';
++    Object.defineProperty(document, 'fonts', { value: { load: async () => [] }, configurable: true });
++    vi.stubGlobal('matchMedia', (query: string) => ({
++      matches: false,
++      media: query,
++      addEventListener() {},
++      removeEventListener() {},
++    }));
++    vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => {
++      const payload = String((init.body as URLSearchParams).get('q'));
++      requests.push(payload);
++      // An identity answer: the endpoint hands the payload back with its markers intact.
++      return { ok: true, status: 200, json: async () => [[[payload, payload, null, null, 1]], null, 'en'] };
++    });
++  });
++
++  it('translates once, swaps the text and keeps it in place', async () => {
++    const { host, root } = await renderPanel('fa');
++    const toggle = host.querySelector('button[aria-label="Translate the lyrics"]') as HTMLElement | null;
++    expect(toggle).not.toBeNull();
++    await act(async () => toggle!.click());
++    await act(async () => {
++      await new Promise((resolve) => setTimeout(resolve, 250));
++    });
++    expect(requests).toHaveLength(1);
++    expect(host.querySelector('button[aria-label="Show the original lyrics"]')).not.toBeNull();
++    // Persian is right to left, so the canvas is told so.
++    expect(host.querySelector('am-lyrics')?.getAttribute('dir')).toBe('rtl');
++
++    // Back to the original: an answer from the cache, not a second request.
++    await act(async () => (host.querySelector('button[aria-label="Show the original lyrics"]') as HTMLElement).click());
++    expect(requests).toHaveLength(1);
++    expect(host.querySelector('button[aria-label="Translate the lyrics"]')).not.toBeNull();
++    await act(async () => root.unmount());
++  });
++
++  it('stacks the two languages when the layout asks for it, without asking again', async () => {
++    // Real text, not the echo: a translation that reads the same as the line is left out.
++    vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => {
++      const payload = String((init.body as URLSearchParams).get('q'));
++      requests.push(payload);
++      const body = payload
++        .split(/\uE000[^\uE001]*\uE001/)
++        .map((part) => `ترجمه ${part.trim()}`)
++        .join('\uE0000001\uE001');
++      return { ok: true, status: 200, json: async () => [[[body, body, null, null, 1]], null, 'en'] };
++    });
++    type Element = HTMLElement & { ttml?: string; showTranslation?: boolean };
++    const { host, root } = await renderPanel('fa', 'original-first');
++    await act(async () => (host.querySelector('button[aria-label="Translate the lyrics"]') as HTMLElement).click());
++    await act(async () => {
++      await new Promise((resolve) => setTimeout(resolve, 250));
++    });
++    const lyrics = host.querySelector('am-lyrics') as Element;
++    // English is the bold line, so the panel is not mirrored; the line under it is Persian.
++    expect(lyrics.getAttribute('dir')).toBe('ltr');
++    expect(lyrics.showTranslation).toBe(true);
++    expect(lyrics.hasAttribute('data-secondary-rtl')).toBe(true);
++    expect(lyrics.ttml).toContain('<translation xml:lang="fa">');
++    expect(lyrics.ttml).toContain('<text for="L1">ترجمه Hello there</text>');
++
++    // Translation first: the same answer, restacked in place — one request in total.
++    await act(async () => useLyricsSettings.getState().setTranslationLayout('translation-first'));
++    await act(async () => {
++      await new Promise((resolve) => setTimeout(resolve, 200));
++    });
++    expect(requests).toHaveLength(1);
++    expect(lyrics.getAttribute('dir')).toBe('rtl');
++    expect(lyrics.ttml).toContain('<translation xml:lang="en">');
++    expect(lyrics.ttml).toContain('<text for="L1">Hello there</text>');
++
++    // Off: the original alone, and no second line for it to hide.
++    await act(async () => (host.querySelector('button[aria-label="Show the original lyrics"]') as HTMLElement).click());
++    expect(requests).toHaveLength(1);
++    expect(lyrics.showTranslation).toBe(false);
++    await act(async () => root.unmount());
++  });
++
++  it('offers the layout in the language menu, beside the toggle', async () => {
++    const { host, root } = await renderPanel('fa');
++    await act(async () => (host.querySelector('button[aria-label="Translate to Persian"]') as HTMLElement).click());
++    const choice = [...document.querySelectorAll('[role="menuitemradio"]')].find((node) =>
++      node.textContent?.includes('Translation bold, original below'),
++    ) as HTMLElement | undefined;
++    expect(choice).toBeDefined();
++    await act(async () => choice!.click());
++    expect(useLyricsSettings.getState().translationLayout).toBe('translation-first');
++    await act(async () => root.unmount());
++  });
++
++  it('says so instead of translating when the lyrics are already in the language', async () => {
++    const { host, root } = await renderPanel('en');
++    await act(async () => (host.querySelector('button[aria-label="Translate the lyrics"]') as HTMLElement).click());
++    await act(async () => {
++      await new Promise((resolve) => setTimeout(resolve, 100));
++    });
++    expect(host.textContent).toContain('Already in English.');
++    expect(host.querySelector('button[aria-label="Translate the lyrics"]')).not.toBeNull();
++    await act(async () => root.unmount());
++  });
++});
+diff --git a/web/app/src/shell/LyricsPanel.tsx b/web/app/src/shell/LyricsPanel.tsx
+index dad8ec1..27acfac 100644
+--- a/web/app/src/shell/LyricsPanel.tsx
++++ b/web/app/src/shell/LyricsPanel.tsx
+@@ -1,16 +1,19 @@
+ // Registers <am-lyrics>.
+ import '@uimaxbai/am-lyrics/am-lyrics.js';
+-import { Check, ChevronDown, Loader2, Minus, Settings2 } from 'lucide-react';
++import { Check, ChevronDown, Languages, Loader2, Minus, Settings2 } from 'lucide-react';
+ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+ import { useCanvas } from '@/data/spotify/canvas';
+ import { getBridge } from '@/extension/bridge';
+ import { Menu, MenuHeader, MenuItem, MenuSeparator } from '@/components/Menu';
+ import { LyricClock } from '@/lyrics/clock';
+ import { onUngrantedChange, ungrantedOrigins } from '@/lyrics/http';
++import { TRANSLATION_LAYOUTS } from '@/lyrics/layout';
+ import type { SourceState } from '@/lyrics/repository';
+-import { enabledSources } from '@/lyrics/settings';
++import { enabledSources, useLyricsSettings } from '@/lyrics/settings';
+ import { sourceById, type LyricsSourceId } from '@/lyrics/sources';
++import { LANGUAGES, languageLabel } from '@/lyrics/translation';
+ import { useLyrics, useLyricsUi } from '@/lyrics/useLyrics';
++import { useLyricsTranslation, type LyricsTranslation } from '@/lyrics/useTranslation';
+ import { getAudio, getPlayhead, usePlayer } from '@/state/player';
+ import { LyricsSettings } from './LyricsSettings';
+ 
+@@ -21,6 +24,10 @@ type AmLyricsElement = HTMLElement & {
+   autoScroll: boolean;
+   highlightColor: string;
+   fontFamily?: string;
++  /** The library's second-language line (its `@state`, drawn under the main one). */
++  showTranslation?: boolean;
++  /** Its own Google calls are off: both languages come from this app. */
++  noAutoAlternates?: boolean;
+   updateComplete?: Promise<unknown>;
+ };
+ 
+@@ -86,6 +93,32 @@ const FULL_SIZE =
+   ' --am-lyrics-line-height: 1.2; --am-lyrics-line-spacing: calc(var(--bitchord-lyric-size, 34px) * 0.7);' +
+   ' --lyrics-scroll-padding-top: 30%; --am-lyrics-inline-padding: 0px; }';
+ 
++/**
++ * Right-to-left destinations (Persian, Arabic, Hebrew, Urdu): the host carries
++ * `dir="rtl"`, which the shadow tree inherits, and the lines are pinned to the
++ * right edge where the panel's layout allows it.
++ */
++const RTL_ALIGN = ":host([dir='rtl']) .lyrics-line { text-align: right; }";
++
++/**
++ * The second language, as am-lyrics draws it: a line under the main one, at
++ * 0.6em and half opacity — a caption rather than words. Slightly larger, a
++ * touch brighter and at medium weight it stays legible under a bold line
++ * without competing with it. `unicode-bidi: plaintext` gives each line the
++ * direction its own script asks for, so Persian under an English lyric keeps
++ * its punctuation where the language puts it, not where the line's `dir` does.
++ * The library's own translate button would switch our second line off under
++ * our feet, so it goes: the panel's toggle is the one that decides.
++ */
++const SECONDARY_LINES =
++  '.lyrics-translation-container { font-size: 0.64em; font-weight: 500; opacity: 0.75;' +
++  ' padding-top: 0.22em; line-height: 1.25; unicode-bidi: plaintext; }' +
++  // Abar is the system's Persian face; the lyric face covers every other script.
++  ":host([data-secondary-rtl]) .lyrics-translation-container {" +
++  " font-family: 'Abar', 'Vazirmatn', 'BitChord SF Pro Display', 'DM Sans', system-ui, sans-serif; }" +
++  ".lyrics-header .header-controls .download-button[aria-label='Toggle translation']" +
++  ' { display: none !important; }';
++
+ /**
+  * am-lyrics, exactly as it is, fed our TTML and a steered clock (prompt §10.2).
+  * The clock reads the media time each frame, stamps the reading with when it
+@@ -93,7 +126,19 @@ const FULL_SIZE =
+  * dates readings by sample time" lesson. No React state per frame: the time is
+  * written straight onto the element.
+  */
+-function LyricsView({ ttml, full }: { ttml: string; full: boolean }) {
++function LyricsView({
++  ttml,
++  full,
++  rtl = false,
++  bilingual = false,
++  secondaryRtl = false,
++}: {
++  ttml: string;
++  full: boolean;
++  rtl?: boolean;
++  bilingual?: boolean;
++  secondaryRtl?: boolean;
++}) {
+   const host = useRef<HTMLDivElement>(null);
+   const element = useRef<AmLyricsElement | null>(null);
+   const deck = usePlayer((s) => s.deck);
+@@ -106,11 +151,16 @@ function LyricsView({ ttml, full }: { ttml: string; full: boolean }) {
+   // and finished after ours, wiping it.
+   useEffect(() => {
+     const el = document.createElement('am-lyrics') as AmLyricsElement;
++    // Set before the TTML: its own Google round-trip only ever knows one
++    // language, and both are already in the document we hand it.
++    el.noAutoAlternates = true;
+     el.ttml = ttml;
+     el.interpolate = true;
+     el.autoScroll = true;
+     el.highlightColor = '#ffffff';
+     el.fontFamily = LYRIC_FONT;
++    el.showTranslation = bilingual;
++    el.toggleAttribute('data-secondary-rtl', secondaryRtl);
+     el.className = 'block min-h-0 flex-1 overflow-hidden [--am-lyrics-highlight-color:#fff]';
+     el.toggleAttribute('data-full', full);
+     const onLineClick = (event: Event) => {
+@@ -125,7 +175,7 @@ function LyricsView({ ttml, full }: { ttml: string; full: boolean }) {
+       const root = el.shadowRoot;
+       if (!root) return;
+       const sheet = new CSSStyleSheet();
+-      sheet.replaceSync(HIDE_FOOTER + FAR_LINES + FULL_SIZE);
++      sheet.replaceSync(HIDE_FOOTER + FAR_LINES + FULL_SIZE + RTL_ALIGN + SECONDARY_LINES);
+       root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
+       // The full-screen column fades its top edge, but am-lyrics' toolbar
+       // (romanize, translate, download) sits at the top of the same scroller
+@@ -152,6 +202,20 @@ function LyricsView({ ttml, full }: { ttml: string; full: boolean }) {
+     if (element.current && element.current.ttml !== ttml) element.current.ttml = ttml;
+   }, [ttml]);
+ 
++  // The second language is a property of what is on screen, not of the element:
++  // toggling the translation or changing the layout turns it on and off here.
++  useEffect(() => {
++    if (element.current) element.current.showTranslation = bilingual;
++  }, [bilingual]);
++
++  useEffect(() => {
++    element.current?.toggleAttribute('data-secondary-rtl', secondaryRtl);
++  }, [secondaryRtl]);
++
++  useEffect(() => {
++    element.current?.setAttribute('dir', rtl ? 'rtl' : 'ltr');
++  }, [rtl]);
++
+   useEffect(() => {
+     const audio = getAudio();
+     const el = element.current;
+@@ -236,8 +300,85 @@ function useUngranted(): string[] {
+ 
+ const NO_STATES: Partial<Record<LyricsSourceId, SourceState>> = {};
+ 
++const actionButton =
++  'inline-flex h-7 items-center gap-1 rounded-[8px] px-1.5 type-callout-emphasized text-secondary hover:bg-quinary';
++
++/**
++ * The translate toggle and its destination, beside the source credit: the
++ * glyph switches versions (and spins while a request is out), the name beside
++ * it opens the language list, and the bottom of that list stacks the two
++ * languages — a choice worth having mid-song, so it is not buried in settings.
++ */
++function TranslateControls({ translation }: { translation: LyricsTranslation }) {
++  const [anchor, setAnchor] = useState<HTMLElement | null>(null);
++  const { showing, pending, target, toggle, setTarget } = translation;
++  const layout = useLyricsSettings((s) => s.translationLayout);
++  const setLayout = useLyricsSettings((s) => s.setTranslationLayout);
++  return (
++    <>
++      <button
++        className={`${actionButton} aria-pressed:text-key aria-pressed:hover:bg-quinary`}
++        aria-pressed={showing}
++        aria-label={showing ? 'Show the original lyrics' : 'Translate the lyrics'}
++        title={showing ? 'Show the original lyrics' : 'Translate the lyrics'}
++        onClick={toggle}
++      >
++        {pending ? <Loader2 size={15} className="animate-spin" /> : <Languages size={15} />}
++      </button>
++      <button
++        className={`${actionButton} font-normal`}
++        aria-haspopup="menu"
++        aria-label={`Translate to ${languageLabel(target)}`}
++        onClick={(e) => setAnchor(e.currentTarget)}
++      >
++        <span>{languageLabel(target)}</span>
++        <ChevronDown size={12} />
++      </button>
++      {anchor && (
++        <Menu anchor={anchor} placement="below-end" onClose={() => setAnchor(null)} label="Translate to">
++          <MenuHeader>Translate to</MenuHeader>
++          {LANGUAGES.map((language) => (
++            <MenuItem
++              key={language.code}
++              checked={language.code === target}
++              onSelect={() => {
++                setAnchor(null);
++                setTarget(language.code);
++              }}
++            >
++              {language.label}
++            </MenuItem>
++          ))}
++          <MenuSeparator />
++          <MenuHeader>Layout</MenuHeader>
++          {TRANSLATION_LAYOUTS.map((choice) => (
++            <MenuItem
++              key={choice.id}
++              checked={choice.id === layout}
++              onSelect={() => {
++                setAnchor(null);
++                setLayout(choice.id);
++              }}
++            >
++              {choice.label}
++            </MenuItem>
++          ))}
++        </Menu>
++      )}
++    </>
++  );
++}
++
+ /** The provider picker: which provider these lyrics are from, and the others' answers for this track. */
+-function ProviderPicker({ current, full }: { current: LyricsSourceId | null; full: boolean }) {
++function ProviderPicker({
++  current,
++  full,
++  translation,
++}: {
++  current: LyricsSourceId | null;
++  full: boolean;
++  translation: LyricsTranslation;
++}) {
+   const videoId = usePlayer((s) => s.nowPlaying?.videoId ?? '');
+   const states = useLyricsUi((s) => s.states[videoId]) ?? NO_STATES;
+   const picked = useLyricsUi((s) => s.picked[videoId]);
+@@ -264,13 +405,16 @@ function ProviderPicker({ current, full }: { current: LyricsSourceId | null; ful
+         <span>{label}</span>
+         <ChevronDown size={14} />
+       </button>
+-      <button
+-        className="grid size-7 place-items-center rounded-[8px] text-secondary hover:bg-quinary"
+-        aria-label="Lyric settings"
+-        onClick={() => setSettings(true)}
+-      >
+-        <Settings2 size={16} />
+-      </button>
++      <div className="flex items-center gap-0.5">
++        {translation.available && <TranslateControls translation={translation} />}
++        <button
++          className="grid size-7 place-items-center rounded-[8px] text-secondary hover:bg-quinary"
++          aria-label="Lyric settings"
++          onClick={() => setSettings(true)}
++        >
++          <Settings2 size={16} />
++        </button>
++      </div>
+       {anchor && (
+         <Menu anchor={anchor} placement="below-end" onClose={close} label="Lyrics provider">
+           <MenuItem checked={!picked} onSelect={() => (close(), pick(videoId, null))}>
+@@ -365,6 +509,53 @@ function CanvasBackdrop({ url }: { url: string }) {
+   );
+ }
+ 
++/**
++ * The lyric canvas, cross-faded as the original and translated versions swap
++ * places: am-lyrics reloads its TTML a beat after the string changes, so the
++ * fade goes out first, the new text is set, and it comes back in. Reduce-motion
++ * swaps at once.
++ */
++function LyricsStage({
++  ttml,
++  full,
++  rtl,
++  bilingual,
++  secondaryRtl,
++}: {
++  ttml: string;
++  full: boolean;
++  rtl: boolean;
++  bilingual: boolean;
++  secondaryRtl: boolean;
++}) {
++  const [shown, setShown] = useState(ttml);
++  const [dim, setDim] = useState(false);
++  const current = useRef(ttml);
++  useEffect(() => {
++    if (ttml === current.current) return;
++    const reduced = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
++    if (reduced) {
++      current.current = ttml;
++      setShown(ttml);
++      return;
++    }
++    setDim(true);
++    const timer = window.setTimeout(() => {
++      current.current = ttml;
++      setShown(ttml);
++      setDim(false);
++    }, 120);
++    return () => window.clearTimeout(timer);
++  }, [ttml]);
++  return (
++    <div
++      className={`flex min-h-0 flex-1 flex-col transition-opacity duration-200 motion-reduce:transition-none ${dim ? 'opacity-0' : 'opacity-100'}`}
++    >
++      <LyricsView ttml={shown} full={full} rtl={rtl} bilingual={bilingual} secondaryRtl={secondaryRtl} />
++    </div>
++  );
++}
++
+ const panel = 'group/panel relative isolate flex min-h-0 flex-1 flex-col overflow-hidden';
+ // The full-screen player's column (report §7): lines 26px, then 30px from 980px, 36px from 1320px and 42px from 1680px.
+ const fullSizes =
+@@ -386,6 +577,7 @@ export function LyricsPanel({ variant = 'panel' }: { variant?: 'panel' | 'full'
+   const canvas = useCanvas();
+   const fontReady = useLyricFont();
+   const result = lyrics.data;
++  const translation = useLyricsTranslation(result, videoId);
+   const full = variant === 'full';
+   const empty = full
+     ? 'flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center type-title-3 text-secondary'
+@@ -395,7 +587,10 @@ export function LyricsPanel({ variant = 'panel' }: { variant?: 'panel' | 'full'
+   return (
+     <div className={full ? `${panel} ${fullSizes}` : panel}>
+       {canvas && variant === 'panel' && <CanvasBackdrop url={canvas} />}
+-      <ProviderPicker current={result?.source ?? null} full={full} />
++      <ProviderPicker current={result?.source ?? null} full={full} translation={translation} />
++      {translation.notice && (
++        <p className={`px-4 pb-1 type-callout text-secondary${full ? ' text-center' : ''}`}>{translation.notice}</p>
++      )}
+       {/* Only worth raising when nothing was found: then the hosts behind the extension might have it. */}
+       {ungranted.length > 0 && !result && !lyrics.isFetching && <PermissionNotice origins={ungranted} />}
+       {!hasTrack ? (
+@@ -408,7 +603,13 @@ export function LyricsPanel({ variant = 'panel' }: { variant?: 'panel' | 'full'
+           <Loader2 size={20} className="animate-spin" />
+         </div>
+       ) : result ? (
+-        <LyricsView ttml={result.ttml} full={full} />
++        <LyricsStage
++          ttml={translation.ttml ?? result.ttml}
++          full={full}
++          rtl={translation.rtl}
++          bilingual={translation.bilingual}
++          secondaryRtl={translation.secondaryRtl}
++        />
+       ) : picked ? (
+         <div className={empty}>
+           <p className={emptyTitle}>Not on {sourceById(picked)?.label ?? 'this provider'}</p>
+diff --git a/web/app/src/shell/LyricsSettings.tsx b/web/app/src/shell/LyricsSettings.tsx
+index bded0cd..cb26622 100644
+--- a/web/app/src/shell/LyricsSettings.tsx
++++ b/web/app/src/shell/LyricsSettings.tsx
+@@ -1,10 +1,12 @@
+-import { ArrowDown, ArrowUp, X } from 'lucide-react';
++import { ArrowDown, ArrowUp, Check, X } from 'lucide-react';
+ import { useEffect, useState } from 'react';
+ import { createPortal } from 'react-dom';
+ import { getBridge } from '@/extension/bridge';
+ import { LYRIC_EXTENSION_ORIGINS as EXTENSION_ORIGINS } from '@/lyrics/http';
++import { TRANSLATION_LAYOUTS } from '@/lyrics/layout';
+ import { useLyricsSettings } from '@/lyrics/settings';
+ import { sourceById } from '@/lyrics/sources';
++import { LANGUAGES, languageLabel } from '@/lyrics/translation';
+ 
+ const section = 'mx-1 mt-[18px] mb-1.5 type-subhead-emphasized uppercase text-secondary';
+ const note = 'mx-1 mb-2 type-callout text-secondary';
+@@ -21,10 +23,27 @@ const moveButton = 'grid size-[26px] place-items-center rounded-[6px] text-secon
+  * page can't.
+  */
+ export function LyricsSettings({ onClose }: { onClose: () => void }) {
+-  const { order, disabled, preferSyllables, paxsenixKey, setEnabled, move, setPreferSyllables, setPaxsenixKey, reset } =
+-    useLyricsSettings();
++  const {
++    order,
++    disabled,
++    preferSyllables,
++    paxsenixKey,
++    translateTo,
++    translationLayout,
++    setEnabled,
++    move,
++    setPreferSyllables,
++    setPaxsenixKey,
++    setTranslateTo,
++    setTranslationLayout,
++    reset,
++  } = useLyricsSettings();
+   const [granted, setGranted] = useState<string[] | null>(null);
+   const [key, setKey] = useState(paxsenixKey);
++  // The browser's language starts as the destination even when the picker does not list it.
++  const destinations = LANGUAGES.some((language) => language.code === translateTo)
++    ? LANGUAGES
++    : [...LANGUAGES, { code: translateTo, label: languageLabel(translateTo) }];
+ 
+   useEffect(() => {
+     const check = () =>
+@@ -97,6 +116,48 @@ export function LyricsSettings({ onClose }: { onClose: () => void }) {
+             </span>
+           </label>
+ 
++          <h3 className={section}>Translation</h3>
++          <label className={`${group} ${row}`}>
++            <span className="flex min-w-0 flex-1 flex-col">
++              <span className="type-body-emphasized">Translate to</span>
++              <span className="type-callout text-secondary">The language the translate button in the lyrics turns them into.</span>
++            </span>
++            <select
++              className="flex-none rounded-[8px] bg-quaternary px-2 py-1 type-callout text-primary"
++              value={translateTo}
++              aria-label="Translate lyrics to"
++              onChange={(e) => setTranslateTo(e.currentTarget.value)}
++            >
++              {destinations.map((language) => (
++                <option key={language.code} value={language.code}>
++                  {language.label}
++                </option>
++              ))}
++            </select>
++          </label>
++
++          <p className={note}>While the translate button is on, how the two languages stack.</p>
++          <div className={group} role="radiogroup" aria-label="Translation layout">
++            {TRANSLATION_LAYOUTS.map((choice) => {
++              const selected = choice.id === translationLayout;
++              return (
++                <button
++                  key={choice.id}
++                  type="button"
++                  role="radio"
++                  aria-checked={selected}
++                  className={`${row} w-full text-start [&+&]:border-t-[0.5px] [&+&]:border-t-divider`}
++                  onClick={() => setTranslationLayout(choice.id)}
++                >
++                  <span className="flex min-w-0 flex-1 flex-col">
++                    <span className="type-body-emphasized">{choice.label}</span>
++                  </span>
++                  {selected && <Check size={14} className="flex-none text-key" />}
++                </button>
++              );
++            })}
++          </div>
++
+           <h3 className={section}>Extension access</h3>
+           {granted === null ? (
+             <p className={note}>KuGou, Musixmatch, Genius and PaxSenix need the BitChord extension.</p>
+diff --git a/web/app/src/shell/Notice.tsx b/web/app/src/shell/Notice.tsx
+new file mode 100644
+index 0000000..08413c7
+--- /dev/null
++++ b/web/app/src/shell/Notice.tsx
+@@ -0,0 +1,22 @@
++import { useUi } from '@/state/ui';
++
++/**
++ * A one-off message over the player — the player menu's answers ("No video
++ * version found for this song"). Above the full-screen player, below the
++ * menus, out of the way: it never takes a press.
++ */
++export function Notice() {
++  const notice = useUi((s) => s.notice);
++  if (!notice) return null;
++  return (
++    <div
++      className="pointer-events-none fixed inset-x-0 bottom-[calc(var(--player-pill-height)+var(--player-bottom-offset)+20px)] z-[calc(var(--z-contextual-menus)-1)] flex justify-center px-5"
++      role="status"
++      aria-live="polite"
++    >
++      <div className="animate-fade-in rounded-pill bg-quinary px-4 py-2 type-title-3 text-primary shadow-[0_8px_24px_rgb(0_0_0/0.24)]">
++        {notice}
++      </div>
++    </div>
++  );
++}
+diff --git a/web/app/src/state/musicOnly.test.ts b/web/app/src/state/musicOnly.test.ts
+new file mode 100644
+index 0000000..04550bd
+--- /dev/null
++++ b/web/app/src/state/musicOnly.test.ts
+@@ -0,0 +1,100 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import type { Track } from '@/data/music/types';
++
++// What the resolver makes of YouTube's pair and of a search is
++// data/music/versions.test.ts's own subject; what this tests is what musicOnly
++// makes of its answer: which cut plays, and when it stops asking.
++vi.mock('@/data/music/api', () => ({ resolveAudio: vi.fn() }));
++
++const { resolveAudio } = await import('@/data/music/api');
++const { kindOf, songFor, useMusicOnly } = await import('./musicOnly');
++const { useVideo } = await import('@/state/video');
++
++const track = (videoId: string, album: string | null = null): Track => ({
++  videoId,
++  title: videoId,
++  artists: [],
++  album: album ? { name: album, id: null } : null,
++  durationSec: null,
++  explicit: false,
++  thumbnail: null,
++  index: null,
++  plays: null,
++});
++
++beforeEach(() => {
++  useMusicOnly.setState({ preferMusicOnly: true, kept: new Set(), settled: new Set(), kinds: {} });
++  useVideo.setState({ videoId: null });
++  vi.mocked(resolveAudio).mockReset();
++});
++
++describe('kindOf', () => {
++  it('takes the queue’s answer, then the picture, then the catalogue’s own tell', () => {
++    expect(kindOf(track('a', 'Album'))).toBe('song');
++    expect(kindOf(track('a'))).toBe('video');
++    // A video row that names an album is still a video once its picture is up.
++    useVideo.setState({ videoId: 'a' });
++    expect(kindOf(track('a', 'Album'))).toBe('video');
++    // And what the queue said outranks both.
++    useMusicOnly.setState({ kinds: { a: 'song' } });
++    expect(kindOf(track('a'))).toBe('song');
++  });
++});
++
++describe('songFor', () => {
++  it('gives a music video its song', async () => {
++    vi.mocked(resolveAudio).mockResolvedValue(track('song'));
++    await expect(songFor(track('video'), false)).resolves.toEqual(track('song'));
++    expect(useMusicOnly.getState().kinds).toEqual({ video: 'video', song: 'song' });
++  });
++
++  it('gives a music video its song even when its row names an album, if its picture is up', async () => {
++    useVideo.setState({ videoId: 'video' });
++    vi.mocked(resolveAudio).mockResolvedValue(track('song'));
++    await expect(songFor(track('video', 'Album'), false)).resolves.toEqual(track('song'));
++  });
++
++  it('leaves a song alone without asking', async () => {
++    await expect(songFor(track('song', 'Album'), false)).resolves.toBeNull();
++    expect(resolveAudio).not.toHaveBeenCalled();
++  });
++
++  it('leaves a video with no song alone, and asks about it once', async () => {
++    vi.mocked(resolveAudio).mockResolvedValue(track('video'));
++    await expect(songFor(track('video'), false)).resolves.toBeNull();
++    await expect(songFor(track('video'), false)).resolves.toBeNull();
++    expect(resolveAudio).toHaveBeenCalledTimes(1);
++    expect(useMusicOnly.getState().settled.has('video')).toBe(true);
++  });
++
++  it('never converts with the setting off, or in a party, or once kept by hand', async () => {
++    vi.mocked(resolveAudio).mockResolvedValue(track('song'));
++    useMusicOnly.setState({ preferMusicOnly: false });
++    await expect(songFor(track('video'), false)).resolves.toBeNull();
++    useMusicOnly.setState({ preferMusicOnly: true, kept: new Set(['video']) });
++    await expect(songFor(track('video'), false)).resolves.toBeNull();
++    useMusicOnly.setState({ kept: new Set() });
++    await expect(songFor(track('video'), true)).resolves.toBeNull();
++    expect(resolveAudio).not.toHaveBeenCalled();
++  });
++
++  it('plays the video as itself when the lookup fails', async () => {
++    vi.mocked(resolveAudio).mockRejectedValue(new Error('offline'));
++    await expect(songFor(track('video'), false)).resolves.toBeNull();
++    expect(useMusicOnly.getState().settled.has('video')).toBe(true);
++  });
++
++  it('does not write off a lookup that is still running', async () => {
++    vi.useFakeTimers();
++    try {
++      vi.mocked(resolveAudio).mockReturnValue(new Promise(() => {}));
++      const answer = songFor(track('video'), false);
++      await vi.advanceTimersByTimeAsync(5_000);
++      await expect(answer).resolves.toBeNull();
++      // Nothing was said about the track, so the next play asks again.
++      expect(useMusicOnly.getState().settled.has('video')).toBe(false);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++});
+diff --git a/web/app/src/state/musicOnly.ts b/web/app/src/state/musicOnly.ts
+new file mode 100644
+index 0000000..f1465a0
+--- /dev/null
++++ b/web/app/src/state/musicOnly.ts
+@@ -0,0 +1,180 @@
++import { create } from 'zustand';
++import type { Track } from '@/data/music/types';
++import { trackLog } from '@/playback/trackLog';
++import { useVideo } from '@/state/video';
++
++/**
++ * "Prefer song over music video" (playback/MusicOnlyPlayback.kt): a music
++ * video in the queue is heard as its catalogue song instead, resolved before
++ * its stream is asked for. The listener can still switch a track between its
++ * two cuts by hand from the player's menu, and that choice sticks.
++ *
++ * The song is found through the video's own watch queue when YouTube pairs the
++ * two (findCuts, data/music/api.ts) and by a search on the title and artist
++ * when it doesn't (resolveAudio, data/music/versions.ts) — signed out, YouTube
++ * pairs nothing at all, and the search is the only way through.
++ */
++
++const SETTING_KEY = 'bitchord:music-only';
++
++/**
++ * How long a video waits for its song before it plays as itself, when nothing
++ * is holding playback for it (MusicOnlyPlayback.ANSWER_TIMEOUT_MS).
++ */
++export const ANSWER_TIMEOUT_MS = 15_000;
++
++/**
++ * How long the *playing* row waits. A pair answers well inside this; the
++ * search fallback can take longer, and holding playback silent that long is
++ * worse than playing the video this time — the answer still lands in the
++ * resolver's cache, so the next play of the track converts.
++ */
++const PLAYING_ANSWER_TIMEOUT_MS = 4_000;
++
++/** Whether the lookup gave up waiting rather than answered. */
++const TIMED_OUT = Symbol('timed out');
++
++/** Which recording a track is, once anything has said. */
++export type CutKind = 'song' | 'video';
++
++interface MusicOnlyState {
++  preferMusicOnly: boolean;
++  /** Videos the listener switched to by hand: they stay videos. */
++  kept: ReadonlySet<string>;
++  /** Tracks with nothing left to ask: a song, a video with no song, or a lookup that answered nothing. */
++  settled: ReadonlySet<string>;
++  /** What each resolved track is, for the player menu's label. */
++  kinds: Record<string, CutKind>;
++  setPreferMusicOnly: (on: boolean) => void;
++  keep: (videoId: string) => void;
++  letGo: (videoId: string) => void;
++  settle: (videoId: string) => void;
++  remember: (videoId: string, kind: CutKind) => void;
++}
++
++const stored = (): boolean => {
++  try {
++    return localStorage.getItem(SETTING_KEY) === '1';
++  } catch {
++    return false;
++  }
++};
++
++/** Off by default, as on the phone; the setting is the listener's to turn on. */
++export const useMusicOnly = create<MusicOnlyState>()((set) => ({
++  preferMusicOnly: stored(),
++  kept: new Set(),
++  settled: new Set(),
++  kinds: {},
++
++  setPreferMusicOnly(preferMusicOnly) {
++    try {
++      localStorage.setItem(SETTING_KEY, preferMusicOnly ? '1' : '0');
++    } catch {
++      // Private browsing: the setting holds for this session.
++    }
++    // Nothing decided under the old value stands (MusicOnlyPlayback.reset).
++    set({ preferMusicOnly, kept: new Set(), settled: new Set() });
++  },
++
++  keep: (videoId) => set((s) => ({ kept: new Set(s.kept).add(videoId) })),
++  letGo: (videoId) =>
++    set((s) => {
++      if (!s.kept.has(videoId)) return s;
++      const kept = new Set(s.kept);
++      kept.delete(videoId);
++      return { kept };
++    }),
++  settle: (videoId) => set((s) => ({ settled: new Set(s.settled).add(videoId) })),
++  remember: (videoId, kind) => set((s) => ({ kinds: { ...s.kinds, [videoId]: kind } })),
++}));
++
++/**
++ * Whether a music video should play as its song: the setting is on, and never
++ * in a Listen Together party, where everyone hears the one cut.
++ */
++export function musicOnlyActive(inParty: boolean): boolean {
++  return useMusicOnly.getState().preferMusicOnly && !inParty;
++}
++
++/**
++ * Which cut [track] is, as far as the app can tell: what its row's queue said
++ * when it was looked up, then its picture being up (a music video's, which a
++ * catalogue song never has), then the catalogue's own tell — a row filed under
++ * an album is the song, an album-less one can only be the video.
++ *
++ * [known] and [picture] are passed in rather than read here so components can
++ * subscribe to them and re-render on the answer.
++ */
++export function kindFrom(known: CutKind | undefined, picture: boolean, track: Pick<Track, 'album'>): CutKind {
++  if (known) return known;
++  if (picture) return 'video';
++  return track.album ? 'song' : 'video';
++}
++
++/** [kindFrom] for callers outside a component render. */
++export function kindOf(track: Track): CutKind {
++  return kindFrom(useMusicOnly.getState().kinds[track.videoId], useVideo.getState().videoId === track.videoId, track);
++}
++
++/** Lookups under way, so the playing row and the one after it don't ask twice. */
++const asking = new Map<string, Promise<Track | null | typeof TIMED_OUT>>();
++
++/**
++ * [track]'s song, asked once at a time and given [waitMs] to answer: the pair
++ * YouTube offers, or the search that stands in for it when it offers none.
++ * Null when the track has no song (or none turned up); [TIMED_OUT] when the
++ * lookup is merely still running.
++ */
++export function songCutFor(track: Track, waitMs = PLAYING_ANSWER_TIMEOUT_MS): Promise<Track | null | typeof TIMED_OUT> {
++  const running = asking.get(track.videoId);
++  if (running) return running;
++  const lookup = import('@/data/music/api')
++    .then(({ resolveAudio }) => resolveAudio(track))
++    .then((song) => (song.videoId === track.videoId ? null : song))
++    .catch((error: unknown) => {
++      trackLog.w(`song lookup failed for '${track.title}': ${error instanceof Error ? error.message : String(error)}`, track.videoId);
++      return null;
++    });
++  const answered = Promise.race([
++    lookup,
++    new Promise<typeof TIMED_OUT>((resolve) => setTimeout(() => resolve(TIMED_OUT), waitMs)),
++  ]);
++  asking.set(track.videoId, answered);
++  return answered.finally(() => asking.delete(track.videoId));
++}
++
++/**
++ * The song [track] should play as, or null when it plays as itself: it is a
++ * song, it was kept as a video by hand, or no song turned up in time. The
++ * answer is remembered, so a track is asked about once a session.
++ */
++export async function songFor(track: Track, inParty: boolean): Promise<Track | null> {
++  const { videoId } = track;
++  // A catalogue song is known at once, with no lookup: it says its album, and
++  // nothing on screen shows a picture for it.
++  if (kindOf(track) === 'song') return null;
++  if (!wantsSong(videoId, inParty)) return null;
++  const song = await songCutFor(track);
++  // The setting or the party may have changed while the answer was coming.
++  if (!wantsSong(videoId, inParty)) return null;
++  const state = useMusicOnly.getState();
++  if (song === TIMED_OUT) {
++    // Still being looked up: not settled, so the next play of it tries again
++    // (and finds the answer already cached when the lookup did land).
++    trackLog.d(`song lookup still running for '${track.title}'; playing the video`, videoId);
++    return null;
++  }
++  if (!song) {
++    state.settle(videoId);
++    return null;
++  }
++  state.remember(videoId, 'video');
++  state.remember(song.videoId, 'song');
++  return song;
++}
++
++function wantsSong(videoId: string, inParty: boolean): boolean {
++  const { kept, settled, kinds } = useMusicOnly.getState();
++  return musicOnlyActive(inParty) && !kept.has(videoId) && !settled.has(videoId) && kinds[videoId] !== 'song';
++}
+diff --git a/web/app/src/state/player.ts b/web/app/src/state/player.ts
+index 8cf9766..7cf0077 100644
+--- a/web/app/src/state/player.ts
++++ b/web/app/src/state/player.ts
+@@ -1,5 +1,6 @@
+ import type { DetectedExtension } from '@bitchord/shared/bridge';
+ import { create } from 'zustand';
++import type { VersionTimeMap } from '@/data/music/timeMap';
+ import type { Track } from '@/data/music/types';
+ import { extensionQueryKey } from '@/extension/useExtension';
+ import { artworkAtPixels } from '@/lib/artwork';
+@@ -23,6 +24,7 @@ import {
+ import { trackLog } from '@/playback/trackLog';
+ import type { LoadedTrack, StreamStats, YouTubeEngine } from '@/playback/youtube/engine';
+ import type { AutomixGraph, AutoDJSnapshot } from '@/playback/automix';
++import { kindOf, songFor, useMusicOnly } from '@/state/musicOnly';
+ 
+ export interface NowPlaying {
+   videoId: string;
+@@ -40,6 +42,12 @@ export interface NowPlaying {
+ export type PlayerStatus = 'idle' | 'loading' | 'playing' | 'paused' | 'buffering' | 'error';
+ export type RepeatMode = 'off' | 'all' | 'one';
+ 
++/**
++ * What the player menu's Convert did: switched cuts, found none to switch to
++ * (the current cut says which is missing), or had nothing to switch.
++ */
++export type Conversion = 'converted' | 'no-video' | 'no-audio' | 'none';
++
+ /** Crossfade lengths offered, in seconds; 0 is off. */
+ export const CROSSFADE_CHOICES = [0, 3, 6, 9, 12] as const;
+ 
+@@ -93,6 +101,12 @@ interface PlayerState extends Settings {
+   previous: () => void;
+   togglePlay: () => void;
+   seek: (seconds: number) => void;
++  /**
++   * The player menu's Convert (MusicOnlyPlayback's manual switch): puts the
++   * other cut of what's playing — the song for a video, the video for a song —
++   * in its place, keeping roughly where it was. The choice sticks.
++   */
++  convertVersion: () => Promise<Conversion>;
+   toggleShuffle: () => void;
+   cycleRepeat: () => void;
+   setAutoplay: (on: boolean) => void;
+@@ -409,6 +423,8 @@ export function setPartyHooks(hooks: PartyHooks | null): void {
+   partyHooks = hooks;
+ }
+ const intent = () => partyHooks?.onIntent();
++/** In a party everyone hears the one cut, so nothing is converted (MusicOnlyPlayback.isActive). */
++const inParty = () => partyHooks?.inParty() ?? false;
+ 
+ // ---- Store ------------------------------------------------------------------------
+ 
+@@ -561,6 +577,55 @@ export const usePlayer = create<PlayerState>()((set, get) => ({
+     intent();
+   },
+ 
++  async convertVersion() {
++    // In a party everyone hears the one cut; switching would put this device alone on the other.
++    if (inParty()) return 'none';
++    const { queue, index } = get();
++    const entry = queue[index];
++    if (!entry) return 'none';
++    const from = entry.track;
++    const isVideo = kindOf(from) === 'video';
++    trackLog.d(
++      `version switch: '${from.title}' is a ${isVideo ? 'video' : 'song'}; looking for its ${isVideo ? 'audio' : 'video'} version`,
++      from.videoId,
++    );
++
++    const { fetchTimeMaps, pairedWith, resolveAudio, resolveVideo } = await import('@/data/music/api');
++    const other = isVideo ? await resolveAudio(from) : await resolveVideo(from);
++    if (!other || other.videoId === from.videoId) {
++      trackLog.w(`version switch: no ${isVideo ? 'audio' : 'video'} version of '${from.title}'`, from.videoId);
++      return isVideo ? 'no-audio' : 'no-video';
++    }
++    // The queue moved on while the other cut was looked up: the tap was for a
++    // track that is no longer the one playing.
++    const now = get();
++    if (now.queue[now.index]?.entryId !== entry.entryId) return 'none';
++
++    const musicOnly = useMusicOnly.getState();
++    musicOnly.remember(from.videoId, isVideo ? 'video' : 'song');
++    musicOnly.remember(other.videoId, isVideo ? 'song' : 'video');
++    // The choice is kept, as on the phone: a video switched to by hand stays a
++    // video, and the song it was switched from is let go.
++    if (!isVideo) musicOnly.keep(other.videoId);
++    else musicOnly.letGo(from.videoId);
++
++    // The two cuts are the same recording, so the song picks up where the
++    // video was: at the moment YouTube's map lines them up, when there is one,
++    // and otherwise at the same second (give or take the video's intro).
++    const audio = getAudio();
++    const position = audio?.currentTime ?? 0;
++    // Only a pair YouTube made itself carries a time map, so only that is worth
++    // the request: a cut found by search is lined up by the second instead.
++    const maps =
++      pairedWith(from.videoId) === other.videoId ? fetchTimeMaps(from.videoId).catch(() => null) : null;
++    const startSec = await mappedPosition(maps, from.videoId, other.videoId, position);
++    const resuming = !audio || !audio.paused;
++    replaceEntry(entry.entryId, other);
++    await startAt(index, { startSec, autoplay: resuming });
++    intent();
++    return 'converted';
++  },
++
+   toggleShuffle() {
+     const { queue, index, shuffle } = get();
+     const head = queue.slice(0, index + 1);
+@@ -669,7 +734,7 @@ function insertUser(tracks: Track[], source: QueueSource | null, isNext: boolean
+ /** Loads queue[at] into the deck in front and plays it. `auto` marks a move the player made on its own. */
+ async function startAt(at: number, { startSec = 0, auto = false, autoplay = true } = {}): Promise<void> {
+   const state = usePlayer.getState();
+-  const entry = state.queue[at];
++  let entry = state.queue[at];
+   if (!entry) return;
+   cancelCrossfade();
+   const token = ++loadToken;
+@@ -687,7 +752,19 @@ async function startAt(at: number, { startSec = 0, auto = false, autoplay = true
+   usePlayer.setState({ index: at, nowPlaying: hintOf(entry.track), status: 'loading', error: null });
+   updateMediaSession(usePlayer.getState().nowPlaying);
+   try {
++    // A music video's song, when the setting prefers one: asked for now and
++    // answered while the decks load, so the video's audio is never heard for a
++    // moment and then swapped under itself.
++    const song = songFor(entry.track, inParty());
+     const all = await getDecks();
++    const answer = await song;
++    if (token !== loadToken) return;
++    if (answer) {
++      entry = { ...entry, track: answer };
++      replaceEntry(entry.entryId, answer);
++      usePlayer.setState({ nowPlaying: hintOf(answer) });
++      updateMediaSession(usePlayer.getState().nowPlaying);
++    }
+     const deck = all[active]!;
+     all[1 - active]!.engine.stop().catch(() => {});
+     deck.gain = 1;
+@@ -766,6 +843,61 @@ function afterTrackStarted() {
+     });
+   }
+   void refillAutoplay();
++  convertUpcoming();
++}
++
++// ---- Song over music video (state/musicOnly, playback/MusicOnlyPlayback.kt) ----------
++
++/**
++ * Puts [track] in [entryId]'s place: the same row, its place, tier and
++ * source untouched, so the queue doesn't move and a party hears it as a swap
++ * of one track's recording rather than a new queue.
++ */
++function replaceEntry(entryId: string, track: Track): void {
++  usePlayer.setState((s) => ({ queue: s.queue.map((e) => (e.entryId === entryId ? { ...e, track } : e)) }));
++}
++
++/**
++ * The row after the playing one, converted ahead of its turn, as the phone
++ * converts the next row too: a crossfade or an AutoMix blend then plans against
++ * the song it will play, rather than against a video it only finds out about
++ * when the blend starts.
++ */
++function convertUpcoming(): void {
++  const { queue, index } = usePlayer.getState();
++  const next = queue[index + 1];
++  if (!next) return;
++  void songFor(next.track, inParty()).then((song) => {
++    if (song) replaceEntry(next.entryId, song);
++  });
++}
++
++/** How long a switch waits for YouTube's time map before keeping the position it has. */
++const TIME_MAP_WAIT_MS = 1_200;
++
++/**
++ * Where [position] in [fromId]'s cut falls in [toId]'s: YouTube's own map when
++ * it answered in time, and otherwise the same second — a video's intro is then
++ * still between the listener and the moment they were at.
++ */
++async function mappedPosition(
++  maps: Promise<Map<string, VersionTimeMap> | null> | null,
++  fromId: string,
++  toId: string,
++  position: number,
++): Promise<number> {
++  const answer = await Promise.race([
++    maps ?? Promise.resolve(null),
++    new Promise<null>((resolve) => setTimeout(() => resolve(null), TIME_MAP_WAIT_MS)),
++  ]);
++  const map = answer?.get(toId);
++  if (!map) {
++    trackLog.d(`version switch: no time map; keeping ${Math.round(position)}s`, fromId);
++    return position;
++  }
++  const mapped = Math.max(0, map.map(Math.max(0, position) * 1000) / 1000);
++  trackLog.d(`version switch: YouTube's time map ${Math.round(position * 1000)}ms -> ${Math.round(mapped * 1000)}ms`, fromId);
++  return mapped;
+ }
+ 
+ // ---- AutoPlay ---------------------------------------------------------------------
+diff --git a/web/app/src/state/ui.ts b/web/app/src/state/ui.ts
+index 0759b57..9c6570b 100644
+--- a/web/app/src/state/ui.ts
++++ b/web/app/src/state/ui.ts
+@@ -16,10 +16,18 @@ interface UiState {
+   /** The extension install banner, dismissed for this tab only. */
+   installBannerDismissed: boolean;
+   dismissInstallBanner: () => void;
++  /** A one-off message over the player (the player menu's answers), gone in a few seconds. */
++  notice: string | null;
++  showNotice: (message: string) => void;
+ }
+ 
+ const BANNER_KEY = 'bitchord:install-banner-dismissed';
+ 
++/** How long a notice stays up. */
++const NOTICE_MS = 3000;
++
++let noticeTimer: ReturnType<typeof setTimeout> | null = null;
++
+ export const useUi = create<UiState>()((set) => ({
+   sidePanel: null,
+   toggleSidePanel: (panel) => set((s) => ({ sidePanel: s.sidePanel === panel ? null : panel })),
+@@ -33,6 +41,12 @@ export const useUi = create<UiState>()((set) => ({
+     sessionStorage.setItem(BANNER_KEY, '1');
+     set({ installBannerDismissed: true });
+   },
++  notice: null,
++  showNotice: (notice) => {
++    if (noticeTimer) clearTimeout(noticeTimer);
++    set({ notice });
++    noticeTimer = setTimeout(() => set({ notice: null }), NOTICE_MS);
++  },
+ }));
+ 
+ // For browser-driven tests, next to __bcPlayer.
+diff --git a/web/app/src/state/video.ts b/web/app/src/state/video.ts
+index 1a018d6..df8e1ac 100644
+--- a/web/app/src/state/video.ts
++++ b/web/app/src/state/video.ts
+@@ -29,10 +29,15 @@ interface VideoState {
+ 
+ const QUALITY_KEY = 'bitchord:video-quality';
+ 
++/** The stored height, or 'auto'; a browser that refuses the store gets the default. */
+ function storedQuality(): VideoQuality {
+-  const stored = localStorage.getItem(QUALITY_KEY);
+-  const height = Number(stored);
+-  return stored && Number.isFinite(height) && height > 0 ? height : 'auto';
++  try {
++    const stored = localStorage.getItem(QUALITY_KEY);
++    const height = Number(stored);
++    return stored && Number.isFinite(height) && height > 0 ? height : 'auto';
++  } catch {
++    return 'auto';
++  }
+ }
+ 
+ export const useVideo = create<VideoState>()(() => ({
