@@ -6,6 +6,10 @@ Run **[BitChord](https://github.com/kushagrasinghx/BitChord)**, the aesthetic Yo
 > This repo has no app code of its own. It contains a patch and an installer that build the upstream web player (`web/`) and its browser extension, and run them locally.
 > It is not affiliated with BitChord, YouTube or Google. If you enjoy BitChord, star and support the [original project](https://github.com/kushagrasinghx/BitChord).
 
+![BitChord Desktop: full-screen player with word-synced lyrics and a Persian translation under each line](docs/screenshot-lyrics-translation.jpg)
+
+<sub>Full-screen player with dual-language lyrics: the original line in bold, its translation below.</sub>
+
 ## What you get
 
 - The upstream BitChord web player, served locally at `http://localhost:5173` and started automatically at login.
@@ -20,6 +24,7 @@ Run **[BitChord](https://github.com/kushagrasinghx/BitChord)**, the aesthetic Yo
 | **Convert to audio / Convert to video** for the current track. Resumes at the matching moment, using YouTube's time map when one exists. | Track menu of the now-playing song |
 | **Lyrics translation**: a port of the Android `LyricsTranslation`. Keeps line and word timing, runs in batches, caches results, and renders RTL languages right-to-left. 33 target languages. | 🌐 button beside the lyrics source |
 | **Dual-language lyrics**: *Original bold, translation below*, *Translation bold, original below*, or *Translation only*. | Lyrics language menu, Lyrics settings |
+| **Always translate**: every song's lyrics open translated. The 🌐 button still switches one song back, and songs already in your language are left as they are. | Lyrics settings → Translation |
 
 ## Install
 

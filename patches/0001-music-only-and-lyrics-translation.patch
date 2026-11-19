@@ -1485,7 +1485,7 @@ index 0000000..8387b2c
 +  };
 +}
 diff --git a/web/app/src/lyrics/settings.ts b/web/app/src/lyrics/settings.ts
-index 0fef966..2909902 100644
+index 0fef966..e572888 100644
 --- a/web/app/src/lyrics/settings.ts
 +++ b/web/app/src/lyrics/settings.ts
 @@ -1,5 +1,11 @@
@@ -1500,7 +1500,7 @@ index 0fef966..2909902 100644
  
  /**
   * Which lyric providers are asked, and in what order (the desktop's lyric
-@@ -13,15 +19,24 @@ interface LyricsSettings {
+@@ -13,15 +19,27 @@ interface LyricsSettings {
    preferSyllables: boolean;
    /** PaxSenix's Spotify and Musixmatch routes need the user's own key. */
    paxsenixKey: string;
@@ -1508,12 +1508,15 @@ index 0fef966..2909902 100644
 +  translateTo: string;
 +  /** How the two languages are stacked while the translation is showing. */
 +  translationLayout: TranslationLayout;
++  /** Every song's lyrics open translated; the button still switches one song back. */
++  alwaysTranslate: boolean;
    setEnabled: (id: LyricsSourceId, on: boolean) => void;
    move: (id: LyricsSourceId, by: -1 | 1) => void;
    setPreferSyllables: (on: boolean) => void;
    setPaxsenixKey: (key: string) => void;
 +  setTranslateTo: (language: string) => void;
 +  setTranslationLayout: (layout: TranslationLayout) => void;
++  setAlwaysTranslate: (on: boolean) => void;
    reset: () => void;
  }
  
@@ -1521,17 +1524,18 @@ index 0fef966..2909902 100644
 -type Saved = Pick<LyricsSettings, 'order' | 'disabled' | 'preferSyllables' | 'paxsenixKey'>;
 +type Saved = Pick<
 +  LyricsSettings,
-+  'order' | 'disabled' | 'preferSyllables' | 'paxsenixKey' | 'translateTo' | 'translationLayout'
++  'order' | 'disabled' | 'preferSyllables' | 'paxsenixKey' | 'translateTo' | 'translationLayout' | 'alwaysTranslate'
 +>;
  
  const DEFAULTS: Saved = {
    order: LYRICS_SOURCES.map((s) => s.id),
-@@ -29,12 +44,24 @@ const DEFAULTS: Saved = {
+@@ -29,12 +47,26 @@ const DEFAULTS: Saved = {
    disabled: ['paxsenix-spotify', 'paxsenix-musixmatch'],
    preferSyllables: false,
    paxsenixKey: '',
 +  translateTo: defaultTargetLanguage(),
 +  translationLayout: DEFAULT_TRANSLATION_LAYOUT,
++  alwaysTranslate: false,
  };
  
  function load(): Saved {
@@ -1548,30 +1552,32 @@ index 0fef966..2909902 100644
 +      translationLayout: isTranslationLayout(saved.translationLayout)
 +        ? saved.translationLayout
 +        : DEFAULTS.translationLayout,
++      alwaysTranslate: saved.alwaysTranslate === true,
 +    };
    } catch {
      return DEFAULTS;
    }
-@@ -43,8 +70,11 @@ function load(): Saved {
+@@ -43,8 +75,11 @@ function load(): Saved {
  export const useLyricsSettings = create<LyricsSettings>()((set, get) => {
    const save = (change: Partial<Saved>) => {
      set(change);
 -    const { order, disabled, preferSyllables, paxsenixKey } = get();
 -    localStorage.setItem(KEY, JSON.stringify({ order, disabled, preferSyllables, paxsenixKey }));
-+    const { order, disabled, preferSyllables, paxsenixKey, translateTo, translationLayout } = get();
++    const { order, disabled, preferSyllables, paxsenixKey, translateTo, translationLayout, alwaysTranslate } = get();
 +    localStorage.setItem(
 +      KEY,
-+      JSON.stringify({ order, disabled, preferSyllables, paxsenixKey, translateTo, translationLayout }),
++      JSON.stringify({ order, disabled, preferSyllables, paxsenixKey, translateTo, translationLayout, alwaysTranslate }),
 +    );
    };
    return {
      ...load(),
-@@ -59,6 +89,8 @@ export const useLyricsSettings = create<LyricsSettings>()((set, get) => {
+@@ -59,6 +94,9 @@ export const useLyricsSettings = create<LyricsSettings>()((set, get) => {
      },
      setPreferSyllables: (preferSyllables) => save({ preferSyllables }),
      setPaxsenixKey: (paxsenixKey) => save({ paxsenixKey: paxsenixKey.trim() }),
 +    setTranslateTo: (translateTo) => save({ translateTo: translateTo.trim() || defaultTargetLanguage() }),
 +    setTranslationLayout: (translationLayout) => save({ translationLayout }),
++    setAlwaysTranslate: (alwaysTranslate) => save({ alwaysTranslate }),
      reset: () => save(DEFAULTS),
    };
  });
@@ -2390,10 +2396,10 @@ index 3b412b1..658bdd8 100644
  }
 diff --git a/web/app/src/lyrics/useTranslation.ts b/web/app/src/lyrics/useTranslation.ts
 new file mode 100644
-index 0000000..6c4b8fd
+index 0000000..1663633
 --- /dev/null
 +++ b/web/app/src/lyrics/useTranslation.ts
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,162 @@
 +import { useCallback, useEffect, useMemo, useState } from 'react';
 +import { create } from 'zustand';
 +import { layoutTtml } from './layout';
@@ -2407,10 +2413,23 @@ index 0000000..6c4b8fd
 + * the component so opening the full-screen player (or closing it) does not
 + * quietly put the original back, as the phone's player doesn't.
 + */
-+const useTranslatedChoice = create<{ token: string | null; setToken: (token: string | null) => void }>((set) => ({
++const useTranslatedChoice = create<{
++  token: string | null;
++  /** The song switched back to its original (or that failed) while Always translate is on. */
++  dismissed: string | null;
++  setToken: (token: string | null) => void;
++  setDismissed: (token: string | null) => void;
++}>((set) => ({
 +  token: null,
++  dismissed: null,
 +  setToken: (token) => set({ token }),
++  setDismissed: (dismissed) => set({ dismissed }),
 +}));
++
++/** Back to no song chosen or dismissed: for tests, which share the store. */
++export function forgetTranslatedChoice(): void {
++  useTranslatedChoice.setState({ token: null, dismissed: null });
++}
 +
 +/**
 + * The panel's translated view: which version is showing, what the request is
@@ -2459,10 +2478,14 @@ index 0000000..6c4b8fd
 +  const token = `${videoId}|${target}`;
 +  const chosen = useTranslatedChoice((s) => s.token);
 +  const setToken = useTranslatedChoice((s) => s.setToken);
++  const dismissed = useTranslatedChoice((s) => s.dismissed);
++  const setDismissed = useTranslatedChoice((s) => s.setDismissed);
++  const always = useLyricsSettings((s) => s.alwaysTranslate);
 +  const [pending, setPending] = useState(false);
 +  const [notice, setNotice] = useState<string | null>(null);
 +  const [ready, setReady] = useState<Ready | null>(null);
-+  const showing = !!result && !!videoId && chosen === token;
++  const manual = chosen === token;
++  const showing = !!result && !!videoId && dismissed !== token && (manual || always);
 +
 +  // New lyrics mean the text in hand belongs to another song.
 +  useEffect(() => {
@@ -2474,9 +2497,11 @@ index 0000000..6c4b8fd
 +    const controller = new AbortController();
 +    setPending(true);
 +    setNotice(null);
-+    const fail = (message: string) => {
++    // Dismissed as well as unchosen, so Always translate doesn't ask again for this song.
++    const fail = (message: string | null) => {
 +      setNotice(message);
 +      setToken(null);
++      setDismissed(token);
 +    };
 +    translateLyrics({ videoId, lines: result.lines, target, signal: controller.signal })
 +      .then((outcome) => {
@@ -2484,7 +2509,8 @@ index 0000000..6c4b8fd
 +        if (outcome.kind === 'translated') {
 +          setReady({ target, lines: outcome.lines, source: outcome.sourceLanguage });
 +        } else if (outcome.kind === 'same') {
-+          fail(`Already in ${languageLabel(outcome.language)}.`);
++          // Said when asked for; with Always translate a song already in the language just stays as it is.
++          fail(manual ? `Already in ${languageLabel(outcome.language)}.` : null);
 +        } else if (outcome.reason !== 'cancelled') {
 +          fail('Translation is unavailable right now. Showing the original lyrics.');
 +        }
@@ -2496,7 +2522,7 @@ index 0000000..6c4b8fd
 +        if (!controller.signal.aborted) setPending(false);
 +      });
 +    return () => controller.abort();
-+  }, [showing, result, videoId, target, setToken]);
++  }, [showing, result, videoId, target, token, manual, setToken, setDismissed]);
 +
 +  // Composed from the answer already in hand: a layout change is a re-render, not a request.
 +  // Gated on `showing`: with the translation off the panel gets no document from
@@ -2513,8 +2539,14 @@ index 0000000..6c4b8fd
 +  const toggle = useCallback(() => {
 +    if (!result) return;
 +    setNotice(null);
-+    setToken(showing ? null : token);
-+  }, [result, showing, token, setToken]);
++    if (showing) {
++      setToken(null);
++      setDismissed(token);
++    } else {
++      setDismissed(null);
++      setToken(token);
++    }
++  }, [result, showing, token, setToken, setDismissed]);
 +
 +  return {
 +    showing: showing && !!laid,
@@ -2586,10 +2618,10 @@ index 4ea40e6..611498a 100644
  }
 diff --git a/web/app/src/shell/LyricsPanel.test.tsx b/web/app/src/shell/LyricsPanel.test.tsx
 new file mode 100644
-index 0000000..ed123de
+index 0000000..d47ef33
 --- /dev/null
 +++ b/web/app/src/shell/LyricsPanel.test.tsx
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,206 @@
 +// @vitest-environment happy-dom
 +/**
 + * The panel's translation wiring: the toggle beside the source credit asks for
@@ -2599,7 +2631,8 @@ index 0000000..ed123de
 + */
 +import { act } from 'react';
 +import { createRoot } from 'react-dom/client';
-+import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { forgetTranslatedChoice } from '@/lyrics/useTranslation';
 +import { line } from '@/lyrics/model';
 +
 +const lyricsResult = {
@@ -2660,6 +2693,7 @@ index 0000000..ed123de
 +    requests.length = 0;
 +    // Answers are cached per track and language; each test starts from none.
 +    forgetTranslations();
++    forgetTranslatedChoice();
 +    // Emptying the test's own body between renders; no page content is involved.
 +    document.body.innerHTML = '';
 +    Object.defineProperty(document, 'fonts', { value: { load: async () => [] }, configurable: true });
@@ -2760,6 +2794,38 @@ index 0000000..ed123de
 +    expect(host.textContent).toContain('Already in English.');
 +    expect(host.querySelector('button[aria-label="Translate the lyrics"]')).not.toBeNull();
 +    await act(async () => root.unmount());
++  });
++
++  describe('Always translate', () => {
++    beforeEach(() => useLyricsSettings.getState().setAlwaysTranslate(true));
++    afterEach(() => useLyricsSettings.getState().setAlwaysTranslate(false));
++    const settle = () =>
++      act(async () => {
++        await new Promise((resolve) => setTimeout(resolve, 250));
++      });
++
++    it('opens translated with no click, and the button switches this song back for good', async () => {
++      const { host, root } = await renderPanel('de');
++      await settle();
++      expect(requests).toHaveLength(1);
++      const back = host.querySelector('button[aria-label="Show the original lyrics"]') as HTMLElement | null;
++      expect(back).not.toBeNull();
++      await act(async () => back!.click());
++      await settle();
++      expect(host.querySelector('button[aria-label="Translate the lyrics"]')).not.toBeNull();
++      expect(requests).toHaveLength(1);
++      await act(async () => root.unmount());
++    });
++
++    it('leaves lyrics already in the language alone: one request, no notice, no retry loop', async () => {
++      const { host, root } = await renderPanel('en');
++      await settle();
++      await settle();
++      expect(requests).toHaveLength(1);
++      expect(host.textContent).not.toContain('Already in English.');
++      expect(host.querySelector('button[aria-label="Translate the lyrics"]')).not.toBeNull();
++      await act(async () => root.unmount());
++    });
 +  });
 +});
 diff --git a/web/app/src/shell/LyricsPanel.tsx b/web/app/src/shell/LyricsPanel.tsx
@@ -3101,7 +3167,7 @@ index dad8ec1..27acfac 100644
          <div className={empty}>
            <p className={emptyTitle}>Not on {sourceById(picked)?.label ?? 'this provider'}</p>
 diff --git a/web/app/src/shell/LyricsSettings.tsx b/web/app/src/shell/LyricsSettings.tsx
-index bded0cd..cb26622 100644
+index bded0cd..3ba6d23 100644
 --- a/web/app/src/shell/LyricsSettings.tsx
 +++ b/web/app/src/shell/LyricsSettings.tsx
 @@ -1,10 +1,12 @@
@@ -3118,7 +3184,7 @@ index bded0cd..cb26622 100644
  
  const section = 'mx-1 mt-[18px] mb-1.5 type-subhead-emphasized uppercase text-secondary';
  const note = 'mx-1 mb-2 type-callout text-secondary';
-@@ -21,10 +23,27 @@ const moveButton = 'grid size-[26px] place-items-center rounded-[6px] text-secon
+@@ -21,10 +23,29 @@ const moveButton = 'grid size-[26px] place-items-center rounded-[6px] text-secon
   * page can't.
   */
  export function LyricsSettings({ onClose }: { onClose: () => void }) {
@@ -3131,12 +3197,14 @@ index bded0cd..cb26622 100644
 +    paxsenixKey,
 +    translateTo,
 +    translationLayout,
++    alwaysTranslate,
 +    setEnabled,
 +    move,
 +    setPreferSyllables,
 +    setPaxsenixKey,
 +    setTranslateTo,
 +    setTranslationLayout,
++    setAlwaysTranslate,
 +    reset,
 +  } = useLyricsSettings();
    const [granted, setGranted] = useState<string[] | null>(null);
@@ -3148,7 +3216,7 @@ index bded0cd..cb26622 100644
  
    useEffect(() => {
      const check = () =>
-@@ -97,6 +116,48 @@ export function LyricsSettings({ onClose }: { onClose: () => void }) {
+@@ -97,6 +118,56 @@ export function LyricsSettings({ onClose }: { onClose: () => void }) {
              </span>
            </label>
  
@@ -3170,6 +3238,14 @@ index bded0cd..cb26622 100644
 +                </option>
 +              ))}
 +            </select>
++          </label>
++
++          <label className={`${group} ${toggle} py-2 pr-2.5 pl-3`}>
++            <input type="checkbox" className={checkbox} checked={alwaysTranslate} onChange={(e) => setAlwaysTranslate(e.currentTarget.checked)} />
++            <span className="flex min-w-0 flex-col">
++              <span className="type-body-emphasized">Always translate</span>
++              <span className="truncate type-callout text-secondary">Every song opens translated. The button still switches one back.</span>
++            </span>
 +          </label>
 +
 +          <p className={note}>While the translate button is on, how the two languages stack.</p>
